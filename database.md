@@ -193,7 +193,41 @@ gaps) is a legitimate full shelf and keeps `low_confidence = false`.
 - `sent_at` historically means "Slack accepted the message"; email timestamps are not
   stored separately.
 
-### 3.8 `products` (reserved)
+### 3.8 `email_settings`
+
+Singleton row (`id = 1`) holding the alert-email transport verified through
+**Alerts → Email setup**. It is not tenant-scoped: one sending identity serves the whole
+installation, and recipients are still resolved per store from `users` at send time.
+
+| Column | Type | Null | Default | Notes |
+|--------|------|------|---------|-------|
+| `id` | Integer | no | — | PK; always `1` |
+| `transport` | String(10) | yes | `NULL` | `api` \| `smtp`; the active channel |
+| `resend_api_key` | String(255) | yes | `NULL` | API transport secret (never returned by the API) |
+| `email_from` | String(320) | yes | `NULL` | Sender for the API transport |
+| `alert_email_to` | String(1000) | yes | `NULL` | Global recipient override |
+| `smtp_host` | String(255) | yes | `NULL` | Relay host |
+| `smtp_port` | Integer | yes | `NULL` | 587 (STARTTLS) or 465 (SSL) |
+| `smtp_user` | String(320) | yes | `NULL` | Relay login |
+| `smtp_password` | String(512) | yes | `NULL` | App password / relay secret |
+| `smtp_from` | String(320) | yes | `NULL` | From: address; falls back to `smtp_user` |
+| `smtp_use_tls` | Boolean | no | `true` | STARTTLS |
+| `smtp_use_ssl` | Boolean | no | `false` | Implicit TLS |
+| `updated_at` | DateTime(tz) | no | `now()` | Last install |
+
+Rules:
+
+- **One active transport.** Saving an API key nulls the SMTP columns; saving SMTP nulls the
+  API columns. Otherwise `email_service` could route through a stale relay.
+- **Precedence at startup.** `email_settings.load_into_settings()` applies the row over
+  `RESEND_API_KEY` / `SMTP_*` environment variables. No row means env vars stay in charge.
+- **Why a table and not `.env`:** a deployed container is read-only or ephemeral, so the old
+  env-file write was lost on every redeploy. This row is what keeps email alerting working
+  after deployment.
+- Deleting the row (or downgrading the migration) returns the installation to env-var
+  configuration; it does not send anything.
+
+### 3.9 `products` (reserved)
 
 | Column | Type | Null | Default |
 |--------|------|------|---------|
@@ -224,6 +258,7 @@ Alembic config: `backend/alembic.ini` (`script_location = migrations`). Run from
 | 4 | `b4d8f1a6c2e9` | `c3d5e7f9a1b2` | Add `users` (+ unique email index, store index) |
 | 5 | `d5e8b3f1c7a4` | `b4d8f1a6c2e9` | Add `shelf_reports.low_confidence`; backfill `urgency='unknown'` rows |
 | 6 | `b8f1c4d7e2a6` | `d5e8b3f1c7a4` | Add `alerts.sent_to_email`, `alerts.email_recipients` |
+| 7 | `a7c1e9f4d2b8` | `b8f1c4d7e2a6` | Add `email_settings` (verified transport survives redeploys) |
 
 Notes:
 
@@ -356,7 +391,11 @@ docker compose up --build
 
 - **Backups:** the SQLite file is the whole database; for PostgreSQL use `pg_dump`.
 - **Uploads are separate:** `backend/uploads/` (or `UPLOAD_DIR`) is not covered by a
-  database dump. Back it up alongside the DB or report images will 404.
+  database dump. Back it up alongside the DB or report images will 404. On Render it lives
+  on the mounted disk at `/var/data/uploads`.
+- **Email credentials are in the database:** `email_settings` holds the verified transport
+  secret. A database dump therefore contains that credential — treat dumps as secrets, and
+  note the API never returns the key (only a masked fingerprint).
 - **Timezone caveat:** SQLite stores naive datetimes; all API responses add `Z`, so
   consumers see correct instants. Direct SQL inspection will show naive values.
 - **Engine creation is import-time:** changing `DATABASE_URL` requires a process restart.

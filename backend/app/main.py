@@ -1,5 +1,6 @@
 import logging
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,7 +8,9 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
+from app.core.database import SessionLocal
 from app.api.v1.api import api_router
+from app.services import email_settings
 
 # Tag descriptions surface as section intros in the Swagger UI at /docs.
 openapi_tags = [
@@ -39,14 +42,38 @@ openapi_tags = [
     },
 ]
 
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Apply email credentials verified through the Email setup screen.
+
+    They live in the database because a deployed container's filesystem is read-only
+    or ephemeral; without this hook the saved row would exist but alerts would still
+    route through whatever the environment variables said. A database failure must not
+    stop the API from booting (the container starts before the first migration on some
+    hosts), so it only downgrades alerting to env-var configuration.
+    """
+    try:
+        with SessionLocal() as db:
+            email_settings.load_into_settings(db)
+    except Exception:
+        logger.warning(
+            "Could not load saved email settings; alert email will fall back to "
+            "environment variables.",
+            exc_info=True,
+        )
+    yield
+
+
 app = FastAPI(
     title=settings.PROJECT_NAME,
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
     description="Backend API for Retail Shelf Monitoring & Restocking Assistant",
     openapi_tags=openapi_tags,
+    lifespan=lifespan,
 )
-
-logger = logging.getLogger(__name__)
 
 
 # NOTE: this must be registered BEFORE CORSMiddleware below. Starlette applies
@@ -68,11 +95,22 @@ async def unhandled_exception_middleware(request: Request, call_next):
         )
 
 
-# Set all CORS enabled origins
-# In production, this should be configured with specific origins from settings
+# CORS: the browser calls this API directly from the Vercel-hosted frontend, so the
+# deployed frontend origin must be allowed. "*" stays the default for local work, but
+# with credentials enabled it lets ANY site drive the API as the signed-in user, so a
+# production deployment sets CORS_ORIGINS (and optionally CORS_ORIGIN_REGEX for the
+# per-branch Vercel preview URLs).
+if settings.IS_STRICT_ENVIRONMENT and settings.cors_origins == ["*"]:
+    logger.warning(
+        "CORS_ORIGINS is '*' with ENVIRONMENT=%s: any website can call this API with "
+        "the visitor's credentials. Set CORS_ORIGINS to the deployed frontend origin.",
+        settings.ENVIRONMENT,
+    )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for development
+    allow_origins=settings.cors_origins,
+    allow_origin_regex=settings.CORS_ORIGIN_REGEX or None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

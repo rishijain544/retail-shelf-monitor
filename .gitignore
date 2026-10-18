@@ -178,6 +178,9 @@ yolov8n.pt
 # Ad-hoc local test images (not used by the automated suites)
 tmp_testimg/
 
+# Hosting CLI state (contains project ids, not secrets, but is machine-specific)
+.vercel/
+
 # Editor/extension state (generated project meta, not source)
 .freebuff/
 .kilo/

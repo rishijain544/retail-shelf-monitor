@@ -7,6 +7,7 @@ from app.models.detection import Detection
 from app.models.shelf_report import ShelfReport
 from app.models.alert import Alert
 from app.models.user import User
+from app.models.email_setting import EmailSetting
 
 __all__ = [
     "Base",
@@ -18,4 +19,5 @@ __all__ = [
     "ShelfReport",
     "Alert",
     "User",
+    "EmailSetting",
 ]

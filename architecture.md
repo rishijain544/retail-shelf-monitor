@@ -60,10 +60,10 @@ retail-shelf-monitor/
 │   │   │   ├── config.py           pydantic-settings, env parsing, strict checks
 │   │   │   ├── database.py         engine, SessionLocal, Base, get_db
 │   │   │   ├── security.py         bcrypt hashing, JWT encode/decode
-│   │   │   ├── auth_deps.py        get_current_user, store/camera guards
-│   │   │   └── env_file.py         surgical .env upsert for email setup
+│   │   │   └── auth_deps.py        get_current_user, store/camera guards
 │   │   ├── models/                 stores, cameras, captures, detections,
-│   │   │                           shelf_reports, alerts, users, products
+│   │   │                           shelf_reports, alerts, users, products,
+│   │   │                           email_settings
 │   │   ├── schemas/                Pydantic request/response models
 │   │   └── services/
 │   │       ├── analyzer_service.py ML adapter, singleton + inference lock
@@ -71,8 +71,9 @@ retail-shelf-monitor/
 │   │       ├── llm_service.py      Anthropic tool use + rule fallback
 │   │       ├── slack_service.py    incoming webhook
 │   │       ├── email_service.py    SMTP / provider-API delivery
-│   │       └── email_setup.py      verify-then-persist credentials
-│   ├── migrations/versions/        Alembic chain (6 revisions)
+│   │       ├── email_setup.py      verify credentials with a real test send
+│   │       └── email_settings.py   load/save that transport in the database
+│   ├── migrations/versions/        Alembic chain (7 revisions)
 │   ├── scripts/                    seed.py, set_resend_key.py
 │   ├── tests/                      pytest suite
 │   ├── Dockerfile                  repo-root build context (needs ml/)
@@ -92,6 +93,7 @@ retail-shelf-monitor/
 │   ├── scripts/                    preprocess, detect, infer, train
 │   └── tests/                      analyzer unit tests
 ├── docker-compose.yml              db + backend + frontend
+├── render.yaml                     API blueprint (Docker, persistent uploads disk)
 └── README.md
 ```
 
@@ -108,7 +110,7 @@ HTTP request
 endpoints/*.py           validate input, enforce auth/tenant scope, shape response
    │                     (FastAPI dependencies: get_current_user, get_db)
    ▼
-services/*.py            domain work: analysis, LLM, Slack, email, .env writes
+services/*.py            domain work: analysis, LLM, Slack, email, credential storage
    │
    ▼
 models/*.py              SQLAlchemy declarative models (Base from core/database)
@@ -257,16 +259,24 @@ lock because background tasks run concurrently on the threadpool.
 silences email while leaving Slack intact. Failures record `_last_error`, surfaced through
 `config_error()` / `last_error()` in health and email-config responses.
 
-**Credential installation** (`email_setup.install` / `install_smtp`):
+**Credential installation** (`email_setup.install` / `install_smtp`, then
+`email_settings.save_*`):
 
 ```
 apply values in memory
   → send a real test message to the caller's login address
   → on failure: restore previous settings, raise ValueError (HTTP 400)
-  → on success: upsert backend/.env atomically, retire the other transport
+  → on success: save the singleton email_settings row, retire the other transport
 ```
 
 This "prove, then persist" flow means a bad paste can never silently break alerts.
+
+Persistence moved from `backend/.env` to the database because a deployed container has a
+read-only (Render) or ephemeral (Vercel, `/tmp`) filesystem: the old upsert only worked on
+a developer machine, so a verified key vanished at the next redeploy and alerts silently
+recorded `sent_to_email=false`. At startup the lifespan hook applies the saved row over the
+environment variables, so env-var configuration still works for operators who never open
+the setup screen.
 
 ### 3.8 Configuration
 
@@ -282,6 +292,7 @@ This "prove, then persist" flow means a bad paste can never silently break alert
 | `RESEND_API_KEY`, `EMAIL_FROM`, `EMAIL_API_URL` | API email transport |
 | `SMTP_HOST/PORT/USER/PASSWORD/FROM/USE_TLS/USE_SSL` | SMTP transport |
 | `ALERT_EMAIL_TO`, `ALERT_EMAIL_ENABLED` | Recipient override / master switch |
+| `CORS_ORIGINS`, `CORS_ORIGIN_REGEX` | Browser origins allowed to call the API |
 | `SECRET_KEY`, `ACCESS_TOKEN_EXPIRE_MINUTES` | JWT signing and lifetime |
 | `ENVIRONMENT` | `development` \| `production` \| `staging` |
 
@@ -338,8 +349,11 @@ and `HealthCards`. `useHealth` polls `/health` every 10 s with an 8 s timeout.
 - Dev: `vite --host 0.0.0.0` on `:5173`, proxying `/uploads` to `localhost:8000`.
 - Prod image: multi-stage `npm ci` → `npm run build` → `nginx:1.27-alpine`, with SPA
   fallback, immutable caching for hashed `/assets/*`, and no caching for `index.html`.
-- `VITE_API_URL` is a **build-time** argument (Vite inlines it); changing it requires a
+- `VITE_API_URL` is a **build-time** value (Vite inlines it); changing it requires a
   rebuild.
+- On Vercel the project's Root Directory is `frontend/`; `frontend/vercel.json` rewrites
+  every path to `index.html` for client-side routes and adds `nosniff` /
+  `strict-origin-when-cross-origin` headers. No dev server or nginx runs there.
 
 ---
 
@@ -391,6 +405,35 @@ frontend (nginx serving the built SPA, published on :5173)
 `ENVIRONMENT` gates strict configuration checks only. There is no separate staging
 deployment definition in the repository.
 
+### 6.4 Vercel frontend + Render API (hosted split)
+
+```
+Vercel (static SPA)  ──HTTPS/JSON──►  Render web service (Docker)
+  frontend/vercel.json                  backend/Dockerfile (repo-root context)
+  VITE_API_URL baked at build           entrypoint: wait → alembic upgrade head → uvicorn
+                                              │                    │
+                                              ▼                    ▼
+                                        Neon Postgres        /var/data (disk)
+                                        (DATABASE_URL)       uploads served at /uploads
+```
+
+The split is forced by the analysis requirements, not preference: the Python function
+limit on Vercel is 500 MB against a ~1.5 GB torch/ultralytics install, the deployed
+filesystem is read-only, the request body is capped at 4.5 MB, and there is no guaranteed
+work after the response — while this pipeline runs inference, writes an image, and sends
+alerts after returning `202`.
+
+Configuration that makes it work:
+
+- `CORS_ORIGINS` must contain the exact Vercel origin; `CORS_ORIGIN_REGEX` can cover
+  per-branch preview hostnames.
+- `UPLOAD_DIR=/var/data/uploads` on the mounted Render disk, so images survive redeploys.
+- `DATABASE_URL` points at Neon; the entrypoint prefers it over the Compose `POSTGRES_*`
+  parts (it would otherwise wait on a host that does not exist).
+- The Render service is a single instance: background tasks and the upload share a process.
+- Uploads are still served by the API's `/uploads` mount, so the frontend's relative image
+  URLs keep working unchanged.
+
 ---
 
 ## 7. Cross-cutting concerns
@@ -401,7 +444,7 @@ deployment definition in the repository.
 | **Tenant isolation** | `store_id` from the token; camera ownership asserted before reads/uploads |
 | **Error shape** | FastAPI `{"detail": …}`; unhandled → JSON 500 via middleware |
 | **Timestamps** | Stored UTC, serialised with `Z`, rendered locally |
-| **Secrets** | `.env` git-ignored; keys masked (`re_abc…wxyz`); targeted `.env` upsert |
+| **Secrets** | `.env` git-ignored; keys masked (`re_abc…wxyz`); verified email credentials stored in the DB, never returned |
 | **Graceful degradation** | Slack/email/LLM failures never abort a capture |
 | **Confidence honesty** | `low_confidence` flag excluded from alerts and trend baselines |
 | **Logging** | `logging` at every pipeline boundary with capture ids and outcomes |
@@ -438,6 +481,8 @@ There is no CI workflow committed in the repository; checks are run locally.
 | JWT in localStorage | Simple, works with the static SPA | XSS-exposed; cookies would be stronger |
 | SQLite + PostgreSQL dual support | Zero-setup local dev, real DB in Compose | Dialect quirks (naive datetimes) require serializer care |
 | `low_confidence` instead of nullable fill | Every consumer keeps a clean float | Clients must honour the flag |
+| Email credentials in the database | Survives redeploys on a read-only filesystem; the setup screen keeps working | One more table to migrate; the secret lives in the DB |
+| API on Render, SPA on Vercel | Keeps YOLO, disk uploads and background delivery working | Two hosts and two dashboards to configure |
 
 ---
 

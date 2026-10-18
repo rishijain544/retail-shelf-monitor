@@ -490,7 +490,11 @@ Reports the installation-wide email transport.
 ### `POST /alerts/email-config`
 
 Install a provider API key (e.g. Resend). The key is proven with a **real test send**
-before anything is written to `backend/.env`; a failure restores the previous settings.
+before anything is stored; a failure restores the previous settings.
+
+On success the verified transport is saved to the singleton `email_settings` row (not
+`backend/.env`), so it survives a redeploy on a read-only container filesystem and is
+reapplied at startup.
 
 **Request**
 
@@ -508,10 +512,12 @@ before anything is written to `backend/.env`; a failure restores the previous se
 | `from_email` | no | Defaults to `EMAIL_FROM`, SMTP sender, or Resend sandbox |
 | `alert_email_to` | no | Comma-separated global override; the first address receives the verification mail |
 
-**Response `200`** — `EmailConfigResponse` with `detail: "key verified and test email delivered"`,
+**Response `200`** — `EmailConfigResponse` with `detail: "key verified, saved and test email delivered"`,
 `key` masked, and `email_delivered_to` listing recipients.
 
-**Errors** — `400` with the provider's reason when the key is malformed or delivery fails.
+**Errors** — `400` with the provider's reason when the key is malformed or delivery fails;
+`500` when the key is verified but the database write fails (the message says so, and the
+credential remains active only for the current process).
 
 ### `POST /alerts/smtp-config`
 
@@ -542,10 +548,12 @@ can deliver to **any** login address.
 | `use_tls` | no | `true` (STARTTLS, port 587) |
 | `use_ssl` | no | `false` (set `true` for implicit TLS on 465) |
 
-**Response `200`** — `EmailConfigResponse` with `detail: "SMTP relay verified and test email delivered"`.
+**Response `200`** — `EmailConfigResponse` with
+`detail: "SMTP relay verified, saved and test email delivered"`.
 
-**Errors** — `400` when the relay rejects the credentials or the test send fails. The
-previous working configuration is preserved.
+**Errors** — `400` when the relay rejects the credentials or the test send fails (the
+previous working configuration is preserved); `500` when verification succeeded but the
+database write failed.
 
 > Installing SMTP retires any saved API key, and installing an API key clears the SMTP
 > settings — only one transport is active at a time.

@@ -81,6 +81,25 @@ class Settings(BaseSettings):
     # configuration checks at the bottom of this class.
     ENVIRONMENT: str = "development"
 
+    # Browser origins allowed to call the API. Comma-separated, e.g.
+    #   CORS_ORIGINS=https://shelf-monitor.vercel.app
+    # The default "*" mirrors the old hardcoded policy and is development-only: with
+    # credentials enabled a wildcard makes every site able to call the API as the
+    # logged-in user. Set this to the deployed frontend origin in production.
+    CORS_ORIGINS: str = "*"
+    # Optional regex for origins that change per deploy — Vercel preview URLs look like
+    # https://shelf-monitor-git-branch-user.vercel.app. Example:
+    #   CORS_ORIGIN_REGEX=https://.*\.vercel\.app
+    CORS_ORIGIN_REGEX: Optional[str] = None
+
+    @property
+    def cors_origins(self) -> list[str]:
+        """Parse CORS_ORIGINS into the list Starlette's CORSMiddleware expects."""
+        raw = (self.CORS_ORIGINS or "").strip()
+        if not raw or raw == "*":
+            return ["*"]
+        return [origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()]
+
     # Auth — secret used to sign JWT access tokens. Read from the SECRET_KEY
     # env var. There is intentionally NO hardcoded default: a committed default
     # would let anyone forge tokens against a deployment that forgot to set it.

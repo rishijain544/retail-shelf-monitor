@@ -9,10 +9,12 @@ POST /alerts/test   Send a diagnostic message to Slack and to the caller's login
 """
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.auth_deps import get_current_user
@@ -26,7 +28,9 @@ from app.models.store import Store
 from app.models.user import User
 from app.schemas.alert import AlertResponse
 from app.schemas.pagination import Page
-from app.services import email_service, email_setup, slack_service
+from app.services import email_service, email_setup, email_settings, slack_service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -162,6 +166,29 @@ def _email_config_state() -> EmailConfigResponse:
     )
 
 
+def _persist_email_settings(saver, db: Session, **values) -> None:
+    """Store verified credentials, translating a DB failure into a clear 500.
+
+    The credentials are already live in this process (``email_setup`` applied them
+    before the test send), so the request is not a no-op — but without the row they
+    would be lost at the next restart. Saying that explicitly beats a generic
+    "Internal server error".
+    """
+    try:
+        saver(db, **values)
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("alerts: verified email credentials could not be saved")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The mail credentials were verified and are active, but saving them to "
+                "the database failed, so they will be lost on restart. Check the "
+                "database connection and save again."
+            ),
+        ) from None
+
+
 class SmtpConfigRequest(BaseModel):
     """SMTP relay credentials — a Gmail App Password delivers to ANY login email.
 
@@ -197,8 +224,12 @@ def save_smtp_config(
 
     A Gmail App Password (or any SMTP relay) can deliver to any address, unlike a
     Resend free-tier key. The credentials are proven by sending a test message to the
-    caller's own login address *before* anything is written to ``backend/.env``, so a
-    bad password fails loudly here and leaves any working configuration in place.
+    caller's own login address *before* anything is stored, so a bad password fails
+    loudly here and leaves any working configuration in place.
+
+    The verified credentials are saved in the database (``email_settings``), not in
+    ``backend/.env``: a deployed container's filesystem is read-only or ephemeral, so
+    env-file persistence would silently lose the relay on the next redeploy.
     """
     store = db.query(Store).filter(Store.id == current_user.store_id).first()
     try:
@@ -216,8 +247,20 @@ def save_smtp_config(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
+    _persist_email_settings(
+        email_settings.save_smtp,
+        db,
+        host=payload.host.strip(),
+        port=payload.port,
+        user=payload.user.strip(),
+        password=payload.password.strip(),
+        smtp_from=(payload.smtp_from or "").strip() or payload.user.strip(),
+        use_tls=payload.use_tls,
+        use_ssl=payload.use_ssl,
+    )
+
     state = _email_config_state()
-    state.detail = "SMTP relay verified and test email delivered"
+    state.detail = "SMTP relay verified, saved and test email delivered"
     state.email_delivered_to = applied["delivered"]
     return state
 
@@ -245,9 +288,12 @@ def save_email_config(
     """Install a mail-provider API key without editing files or restarting.
 
     The key is proven by sending a test message to the caller's own login address *before*
-    anything is written to ``backend/.env``. A bad key therefore fails here, loudly, and
-    leaves any previously working configuration in place — instead of silently turning
-    every future alert into "Not sent".
+    anything is stored. A bad key therefore fails here, loudly, and leaves any previously
+    working configuration in place — instead of silently turning every future alert into
+    "Not sent".
+
+    Verified credentials go to the ``email_settings`` row so they survive a redeploy;
+    writing ``backend/.env`` only worked on a machine with a writable disk.
     """
     store = db.query(Store).filter(Store.id == current_user.store_id).first()
     # The test recipient is the alert_email_to address when provided (required for
@@ -269,9 +315,17 @@ def save_email_config(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
+    _persist_email_settings(
+        email_settings.save_api,
+        db,
+        api_key=email_service.normalize_api_key(payload.api_key),
+        from_email=(payload.from_email or "").strip() or None,
+        alert_email_to=(payload.alert_email_to or "").strip() or None,
+    )
+
     state = _email_config_state()
     state.key = applied["key"]
-    state.detail = "key verified and test email delivered"
+    state.detail = "key verified, saved and test email delivered"
     state.email_delivered_to = applied["delivered"]
     return state
 
@@ -307,9 +361,9 @@ def send_test_alert(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                "No alert channel is configured: set SLACK_WEBHOOK_URL and/or an email "
-                "transport (RESEND_API_KEY, or SMTP_HOST + SMTP_FROM) in backend/.env "
-                "and restart."
+                "No alert channel is configured: set SLACK_WEBHOOK_URL (environment), "
+                "and/or install an email transport from Alerts -> Email setup "
+                "(RESEND_API_KEY or SMTP_HOST + SMTP_FROM env vars also work)."
             ),
         )
 

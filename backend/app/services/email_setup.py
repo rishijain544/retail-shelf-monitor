@@ -19,7 +19,6 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from app.core import env_file
 from app.core.config import settings
 from app.services import email_service
 
@@ -42,12 +41,16 @@ def install(
     store_name: Optional[str] = None,
     alert_email_to: Optional[str] = None,
 ) -> dict:
-    """Apply, test, then persist new credentials.
+    """Apply and test new credentials; the caller persists them once verified.
 
     Returns a summary dict on success; raises ValueError with a human explanation when
     the key is malformed or the provider refuses to send. On failure the previous
-    settings are restored and ``backend/.env`` is left untouched, so a bad paste can
-    never take working alerting down with it.
+    settings are restored, so a bad paste can never take working alerting down with it.
+
+    Persistence deliberately lives in the endpoint (``email_settings.save_api``): this
+    function has no database session and is also exercised directly by tests. It leaves
+    the verified configuration active in memory so the endpoint's save is the only
+    remaining step.
     """
     key = email_service.normalize_api_key(api_key)
     if not key:
@@ -101,19 +104,6 @@ def install(
             or "the provider accepted the key but the test message was not delivered"
         )
 
-    env_file.upsert("RESEND_API_KEY", key)
-    # One active transport at a time: retire the SMTP relay now that the key is proven.
-    for name, value in (
-        ("SMTP_HOST", ""),
-        ("SMTP_USER", ""),
-        ("SMTP_PASSWORD", ""),
-        ("SMTP_FROM", ""),
-    ):
-        env_file.upsert(name, value)
-    if sender:
-        env_file.upsert("EMAIL_FROM", sender)
-    if recipients:
-        env_file.upsert("ALERT_EMAIL_TO", recipients)
     logger.info(
         "email_setup: installed a new API key (%s) and verified delivery.", mask(key)
     )
@@ -150,11 +140,12 @@ def install_smtp(
 
     The credentials are proven with a real test send to ``test_recipient`` (the
     caller's login email) *before* anything is persisted. On failure the previous
-    settings are restored and ``backend/.env`` is left untouched.
+    settings are restored; the endpoint then leaves the stored configuration untouched.
 
     When SMTP is installed it becomes the active transport: the Resend API key and the
-    recipient override are cleared (in memory and in ``.env``) so ``email_service``
-    routes through SMTP and every login email receives the alert.
+    recipient override are cleared in memory, and ``email_settings.save_smtp`` clears
+    them in the database, so ``email_service`` routes through SMTP and every login email
+    receives the alert.
     """
     host = (host or "").strip()
     user = (user or "").strip()
@@ -205,18 +196,6 @@ def install_smtp(
             or "the SMTP relay accepted the credentials but the test message was not delivered"
         )
 
-    env_file.upsert("SMTP_HOST", host)
-    env_file.upsert("SMTP_PORT", str(port))
-    env_file.upsert("SMTP_USER", user)
-    env_file.upsert("SMTP_PASSWORD", password)
-    env_file.upsert("SMTP_FROM", sender)
-    env_file.upsert("SMTP_USE_TLS", "true" if use_tls else "false")
-    env_file.upsert("SMTP_USE_SSL", "true" if use_ssl else "false")
-    # SMTP is now the active transport; clear the Resend key and recipient override so
-    # alerts keep going to each login email.
-    env_file.upsert("RESEND_API_KEY", "")
-    env_file.upsert("EMAIL_FROM", "")
-    env_file.upsert("ALERT_EMAIL_TO", "")
     logger.info("email_setup: installed SMTP relay (%s) and verified delivery.", host)
 
     return {

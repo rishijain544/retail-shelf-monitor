@@ -27,6 +27,7 @@ It is a full-stack monorepo: a **FastAPI** API, a **React + TypeScript** dashboa
 - [Repository layout](#repository-layout)
 - [Quick start (Docker Compose)](#quick-start-docker-compose)
 - [Manual setup](#manual-setup)
+- [Deployment (Vercel + Render + Neon)](#deployment-vercel--render--neon)
 - [Configuration](#configuration)
 - [How a capture is processed](#how-a-capture-is-processed)
 - [Detection and confidence](#detection-and-confidence)
@@ -71,7 +72,7 @@ Every store only ever sees its own cameras, captures, reports, and alerts.
 | **Assessments** | Claude tool-use JSON (`summary`, `urgency`, `recommended_action`) + rule-based fallback |
 | **Honest confidence** | Zero-detection unassessed results are flagged `low_confidence` and shown as **"Unable to assess"**, never as 100 % full; they never alert or seed a trend |
 | **Alerting** | Slack webhook + email, one installation-wide transport, recipients resolved from the store's `users` rows |
-| **Email setup** | Credentials verified with a real test send **before** being written to `backend/.env`; bad pastes leave working settings untouched |
+| **Email setup** | Credentials verified with a real test send **before** being saved; stored in the database so they survive redeploys, and bad pastes leave working settings untouched |
 | **Multi-store isolation** | JWT auth; `store_id` always comes from the token, never from the request |
 | **Reporting** | Filter by aisle / urgency / date, paginate, CSV export, per-report detail with detections |
 | **Trends** | Fill % over time per aisle, with an accessible table view (colour is never the only signal) |
@@ -142,7 +143,7 @@ trade-offs — see [architecture.md](architecture.md).
 | **Alerts** | Slack Incoming Webhook, SMTP (STARTTLS/SSL), Resend-compatible email API |
 | **Frontend** | React 18, TypeScript (strict), Vite 5, React Router 6, Tailwind CSS, Recharts, Lucide |
 | **Testing** | pytest, Vitest, Testing Library |
-| **Runtime** | Docker Compose (PostgreSQL + backend + nginx-served frontend) |
+| **Runtime** | Docker Compose locally; Render (Docker) for the API, Vercel for the SPA, Neon for Postgres |
 
 ---
 
@@ -153,12 +154,13 @@ retail-shelf-monitor/
 ├── backend/
 │   ├── app/
 │   │   ├── api/v1/endpoints/     health, auth, captures, reports, alerts, stores, cameras
-│   │   ├── core/                 config, database, JWT/bcrypt, auth guards, .env writer
+│   │   ├── core/                 config, database, JWT/bcrypt, auth guards
 │   │   ├── models/               SQLAlchemy tables
 │   │   ├── schemas/              Pydantic request/response shapes
 │   │   ├── services/             analyzer, capture pipeline, LLM, Slack, email
+│   │   │                         (email_setup verifies, email_settings persists)
 │   │   └── main.py               app factory, CORS, /uploads mount
-│   ├── migrations/versions/      six Alembic revisions
+│   ├── migrations/versions/      seven Alembic revisions
 │   ├── scripts/                  seed.py, set_resend_key.py
 │   ├── tests/                    pytest suite
 │   ├── Dockerfile
@@ -171,6 +173,7 @@ retail-shelf-monitor/
 │   │   ├── pages/                Dashboard, ShelfDetail, Alerts, Trends, Admin, Login, Signup
 │   │   └── App.tsx               routes + auth gate
 │   ├── nginx.conf
+│   ├── vercel.json               SPA rewrites + security headers
 │   └── Dockerfile
 ├── ml/
 │   ├── shelf_analyzer.py         quality gate, detection, fill %, CLI
@@ -178,6 +181,7 @@ retail-shelf-monitor/
 │   ├── tests/                    analyser tests + fixtures
 │   └── weights/empty_space_best.pt
 ├── docker-compose.yml
+├── render.yaml                   API blueprint (Docker + persistent uploads disk)
 ├── .env.example                  template for Compose
 ├── PRD.md · architecture.md · database.md · api.md · AGENTS.md
 └── README.md
@@ -308,9 +312,112 @@ people and vases as shelf gaps).
 
 ---
 
+## Deployment (Vercel + Render + Neon)
+
+### Why the API is not on Vercel
+
+The analysis pipeline imports the YOLO checkpoint in-process (`torch` + `ultralytics` are
+roughly 1.5 GB installed), writes each uploaded photo to disk, and keeps working after the
+upload response to run detection and send alerts. A Vercel Python function is limited to a
+500 MB bundle, has a read-only filesystem (only ephemeral `/tmp`), a 4.5 MB request-body
+cap, and no guaranteed background execution after the response. The model simply does not
+fit, so this repository deploys the **SPA to Vercel** and the **API to Render** — the
+split is already encoded in [`render.yaml`](render.yaml) and
+[`frontend/vercel.json`](frontend/vercel.json).
+
+| Piece | Host | Notes |
+|-------|------|-------|
+| React SPA | **Vercel** | Static Vite build, SPA rewrites, `VITE_API_URL` at build time |
+| FastAPI + YOLO | **Render** (Docker) | Repo-root build context so `ml/` ships; persistent disk for uploads |
+| PostgreSQL | **Neon** | Free tier is enough; connect with `?sslmode=require` |
+
+### 1. Create the database (Neon)
+
+1. Create a Neon project and copy the **pooled** connection string
+   (`postgresql://user:password@…/dbname?sslmode=require`).
+2. Do **not** run migrations by hand: the container entrypoint waits for the database and
+   runs `alembic upgrade head` on every boot, so the first Render deploy creates the schema.
+
+### 2. Deploy the API (Render)
+
+1. Render Dashboard → **New → Blueprint** → select this repository. Render reads
+   [`render.yaml`](render.yaml).
+2. Fill in the environment variables it marks as `sync: false`:
+
+| Variable | Value |
+|----------|-------|
+| `DATABASE_URL` | The Neon connection string (with `sslmode=require`) |
+| `CORS_ORIGINS` | Your Vercel URL, e.g. `https://shelf-monitor.vercel.app` (no trailing slash) |
+| `SLACK_WEBHOOK_URL` | Slack Incoming Webhook URL (optional but required for Slack alerts) |
+| `ANTHROPIC_API_KEY` | Claude key (optional; rule-based reports otherwise) |
+
+`SECRET_KEY` is generated by Render and kept stable, so logins survive restarts.
+`ENVIRONMENT=production` enforces it. The blueprint also sets `UPLOAD_DIR=/var/data/uploads`
+on a mounted disk, which is why uploaded photos survive redeploys.
+
+> **Plan and memory.** The blueprint uses Render's `standard` instance (2 GB). Torch plus a
+> loaded YOLOv8 model can exceed the 512 MB `starter` instance and get OOM-killed mid-analysis;
+> the disk also requires a paid instance. Downgrade only if you have measured it working.
+
+### 3. Deploy the frontend (Vercel)
+
+1. Vercel → **Add New → Project** → import this repository.
+2. Set **Root Directory** to `frontend`. Vercel detects Vite; the build command and output
+   directory are already in `frontend/vercel.json`.
+3. Add the environment variable for **Production** (and Preview if you use it):
+
+| Variable | Value |
+|----------|-------|
+| `VITE_API_URL` | `https://<your-service>.onrender.com/api/v1` |
+| `VITE_DEMO_EMAIL` / `VITE_DEMO_PASSWORD` | Optional; only if your demo account differs |
+
+4. Deploy. `VITE_*` values are inlined at build time — change one and you must trigger a
+   **new deployment**, not just save the variable.
+
+### 4. Point CORS at the frontend
+
+`CORS_ORIGINS` on Render must contain the exact Vercel origin, otherwise every browser call
+fails with an opaque `Failed to fetch` (the Network tab shows a CORS error, not a 4xx).
+Vercel preview deployments use per-branch hostnames; the blueprint's
+`CORS_ORIGIN_REGEX=https://.*\.vercel\.app` covers them. Remove that regex if you want
+production-only access.
+
+### 5. Seed (optional) and verify
+
+```bash
+# Render Dashboard -> shelf-monitor-api -> Shell
+alembic upgrade head          # idempotent; normally already done by the entrypoint
+python scripts/seed.py        # demo store, cameras, reports, alerts, demo login
+```
+
+Then verify, in this order:
+
+1. `GET https://<service>.onrender.com/api/v1/health` → `status: healthy`, `database: healthy`.
+2. Open the Vercel URL, sign in (or use **Try Demo Account**), and upload a shelf photo;
+   the report should reach `completed`.
+3. **Alerts → Send test alert** should deliver to Slack and to your login email.
+4. If email is not configured, use **Alerts → Email setup**. The verified transport is
+   written to the `email_settings` table, so it keeps working after Render redeploys.
+
+### Deployment notes
+
+- **One API instance.** Analysis + alert delivery use FastAPI background tasks in the same
+  process as the upload. Do not scale the Render service to several instances without
+  moving the pipeline to a queue first; the current design assumes one.
+- **Uploads belong to the instance.** They live under `UPLOAD_DIR`; without the Render disk
+  (or on serverless) images disappear on redeploy while their database rows remain.
+- **Secrets live in the host dashboards**, never in the repository. `render.yaml` uses
+  `sync: false`, and only `.env.example` files with empty values are committed.
+- **Slack has no UI.** It is configured only through `SLACK_WEBHOOK_URL`; changing it
+  requires a Render restart/redeploy. Email can be configured either way (env vars or the UI).
+- **Docker Compose still works unchanged** for local development and self-hosting.
+
+---
+
 ## Configuration
 
-Settings are read from `backend/.env` by pydantic-settings. The repo-root `.env` is only
+Settings are read from `backend/.env` (and from real environment variables, which take
+precedence over the file) by pydantic-settings. The repo-root `.env` is only
 used by Docker Compose for interpolation. Templates with empty values live in
 [`backend/.env.example`](backend/.env.example), [`.env.example`](.env.example), and
 [`frontend/.env.example`](frontend/.env.example).
@@ -324,7 +431,9 @@ used by Docker Compose for interpolation. Templates with empty values live in
 | `ENVIRONMENT` | `development` | `production`/`staging` enforce a strong `SECRET_KEY` |
 | `DATABASE_URL` | — | Explicit SQLAlchemy URL; overrides the Postgres parts |
 | `POSTGRES_SERVER` / `_USER` / `_PASSWORD` / `_DB` / `_PORT` | `localhost` / `postgres` / `postgres` / `shelf_monitoring` / `5432` | Postgres connection |
-| `UPLOAD_DIR` | `backend/uploads` | Where capture images are stored |
+| `UPLOAD_DIR` | `backend/uploads` | Where capture images are stored (`/var/data/uploads` on Render) |
+| `CORS_ORIGINS` | `*` | Comma-separated browser origins allowed to call the API; set the Vercel origin in production |
+| `CORS_ORIGIN_REGEX` | — | Optional regex for changing origins, e.g. `https://.*\.vercel\.app` |
 | `SECRET_KEY` | — | JWT signing key; **required** in production/staging (≥32 chars) |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | `1440` | Token lifetime (1 day) |
 
@@ -461,8 +570,9 @@ RESEND_API_KEY=re_xxxxxxxxxxxxxxxxxxxxxxxx
 EMAIL_FROM=ShelfMonitor <alerts@yourdomain.com>
 ```
 
-The setup dialog verifies the key with a real test send before writing anything to
-`backend/.env`. On failure the previous settings are restored. A free-tier key can usually
+The setup dialog verifies the key with a real test send before saving anything. Verified
+credentials are stored in the `email_settings` table (not `backend/.env`), so they survive a
+redeploy on a read-only filesystem. On failure the previous settings are restored. A free-tier key can usually
 only mail the account owner's address until a sending domain is verified — use SMTP if you
 need every login address.
 
@@ -526,7 +636,7 @@ curl -s $BASE/captures/1/report -H "Authorization: Bearer $TOKEN"
 ## Database and migrations
 
 Default tables: `stores`, `users`, `cameras`, `captures`, `detections`, `shelf_reports`,
-`alerts`, and a reserved `products` table. Details, invariants, and the migration history
+`alerts`, `email_settings` (the verified alert-email transport), and a reserved `products` table. Details, invariants, and the migration history
 are in [database.md](database.md).
 
 ```bash
@@ -637,7 +747,10 @@ no running backend required.
 | Upload rejected as blurry/dark | The image quality gate refused it. Take a sharper, brighter shelf photo. |
 | `libGL.so.1` error with OpenCV | Install the OpenGL runtime (the Docker image already includes it). |
 | Duplicate stores after seeding | Older seed versions were not idempotent. Reset the database and reseed (see [database.md](database.md)). |
-| Deep link 404s in production | nginx must serve the SPA fallback (`try_files … /index.html`); the provided config does. |
+| Deep link 404s in production | nginx must serve the SPA fallback (`try_files … /index.html`); `frontend/vercel.json` rewrites every path to `index.html` on Vercel. |
+| Browser requests fail with `Failed to fetch` after deploying | `CORS_ORIGINS` on the API host does not include the exact frontend origin. Update it and redeploy the API. |
+| Photos 404 after a Render redeploy | Uploads are on the container filesystem. Attach the disk from `render.yaml` and set `UPLOAD_DIR=/var/data/uploads`. |
+| Analysis killed mid-run on Render | The instance ran out of memory. Use the 2 GB `standard` plan; torch + YOLO do not fit in 512 MB. |
 | Frontend calls the wrong API host | `VITE_API_URL` is baked in at build time; rebuild the frontend. |
 
 Logs:
@@ -661,9 +774,13 @@ docker compose logs -f db
   ownership is verified before reads and uploads. Reports outside a store return `404`.
 - **Uploads** are treated as untrusted: content type is validated, filenames are generated,
   and files are served from a fixed static directory.
-- **Development-only defaults.** CORS currently allows `*` and JWTs live in `localStorage`.
-  Before a public deployment, narrow CORS to known origins and consider httpOnly,
-  SameSite cookies with CSRF protection.
+- **CORS defaults to `*`,** which lets any site call the API with a visitor's credentials.
+  A production deployment sets `CORS_ORIGINS` to the Vercel origin (the backend logs a
+  warning at startup when it is still `*` with `ENVIRONMENT=production`). JWTs live in
+  `localStorage`; httpOnly, SameSite cookies with CSRF protection would be stronger.
+- **Email credentials at rest.** The `email_settings` row holds the transport secret in
+  the database (encrypted by the provider at rest). It is never returned by the API — the
+  setup screen shows a masked fingerprint — and it is deleted by the migration downgrade.
 - **Rotate any key** that has ever been shared, committed, or pasted into chat.
 
 ---

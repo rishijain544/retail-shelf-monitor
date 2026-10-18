@@ -1,0 +1,65 @@
+# Render blueprint for the API and analysis pipeline.
+#
+# Why Render and not Vercel for this service: the API imports the trained YOLO model
+# in-process (torch + ultralytics are ~1.5 GB installed), writes uploaded photos to
+# disk, and runs the analysis + Slack/email delivery after the upload response. A
+# Vercel Python function is capped at 500 MB, has a read-only filesystem and no
+# guaranteed background execution, so only the frontend is deployed there.
+#
+# Deploy: Render Dashboard -> New -> Blueprint -> pick this repository. Render reads
+# this file, builds backend/Dockerfile from the repo root (the image also needs ml/),
+# mounts a disk for uploads, then runs the entrypoint (wait for Postgres -> alembic
+# upgrade head -> uvicorn).
+services:
+  - type: web
+    name: shelf-monitor-api
+    runtime: docker
+    # The ML inference needs real memory: torch + OpenCV + a loaded YOLOv8 model do
+    # not fit comfortably in the 512 MB Starter instance. Switch to `starter` only if
+    # you accept occasional OOM restarts during analysis.
+    plan: standard
+    region: oregon
+    dockerfilePath: ./backend/Dockerfile
+    # Repo root, not backend/: the image also needs ml/ (see backend/Dockerfile).
+    dockerContext: .
+    # Override the development CMD (which uses --reload). The image's ENTRYPOINT still
+    # runs first (wait for Postgres -> alembic upgrade head) and then execs this.
+    # Render does not guarantee shell expansion for dockerCommand, so ask for a shell
+    # explicitly; that is what turns $PORT into the port Render assigned.
+    dockerCommand: /bin/sh -c 'exec uvicorn app.main:app --host 0.0.0.0 --port "$PORT"'
+    healthCheckPath: /api/v1/health
+    autoDeploy: true
+    # Uploaded shelf photos must survive redeploys; the container filesystem does not.
+    # Requires a paid instance type (Render disks are not available on Free).
+    disk:
+      name: shelf-uploads
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      # "production" enforces SECRET_KEY and turns on the CORS warning.
+      - key: ENVIRONMENT
+        value: production
+      # Generated once by Render and kept stable, so JWTs stay valid across restarts.
+      - key: SECRET_KEY
+        generateValue: true
+      # Neon (or any Postgres) connection string, including ?sslmode=require.
+      # Paste it in the Render dashboard; never commit it.
+      - key: DATABASE_URL
+        sync: false
+      # Claude summaries. Without it the pipeline falls back to rule-based reports.
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      # High-urgency alert webhook (Slack Incoming Webhook URL).
+      - key: SLACK_WEBHOOK_URL
+        sync: false
+      # The deployed Vercel origin, e.g. https://shelf-monitor.vercel.app.
+      # Comma-separate several; a regex can cover preview URLs.
+      - key: CORS_ORIGINS
+        sync: false
+      - key: CORS_ORIGIN_REGEX
+        value: https://.*\.vercel\.app
+      # Persistent disk mount for capture images, served at /uploads.
+      - key: UPLOAD_DIR
+        value: /var/data/uploads
+      - key: ALERT_EMAIL_ENABLED
+        value: "true"
