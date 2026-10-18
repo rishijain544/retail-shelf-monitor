@@ -1,0 +1,14 @@
+# OpenCV headless for server environments (avoiding GUI library requirements)
+opencv-python-headless>=4.9.0.80
+
+# YOLOv8 and other computer vision models by Ultralytics
+ultralytics>=8.1.0
+
+# Scientific computing and data manipulation
+numpy>=1.26.0
+
+# Pillow image processing
+pillow>=10.2.0
+
+# HTTP client (optional, to upload detections back to FastAPI)
+requests>=2.31.0

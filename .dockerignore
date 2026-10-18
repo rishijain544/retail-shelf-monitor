@@ -1,0 +1,40 @@
+// Build context for the backend image is the repo root (it needs ml/ as well as
+// backend/), so everything the Python image does not need is excluded here.
+// Keep ml/weights/*.pt — the model file is part of the image.
+
+# Frontend has its own build context (./frontend) and is not part of this image.
+frontend/
+
+# Virtualenvs, caches, build leftovers
+**/__pycache__/
+**/*.py[cod]
+**/.venv/
+**/venv/
+**/.mypy_cache/
+**/.pytest_cache/
+**/.ruff_cache/
+**/node_modules/
+**/dist/
+**/build/
+**/*.egg-info/
+
+# Secrets — supplied at runtime via compose `environment:`, never baked in
+.env
+backend/.env
+**/.env.local
+
+# Runtime artifacts: recreated by the entrypoint / mounted at runtime
+backend/uploads/
+ml/output_detected.jpg
+
+# VCS / editor / OS noise
+.git/
+.gitignore
+.vscode/
+.idea/
+**/.DS_Store
+**/Thumbs.db
+
+# Docs and compose files are not needed inside the image
+*.md
+docker-compose*.yml

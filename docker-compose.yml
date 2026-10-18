@@ -1,0 +1,97 @@
+# `version:` is obsolete under Compose v2+ and emits a warning; the schema is
+# inferred. Values below interpolate from the repo-root .env file, which Compose
+# reads automatically — see .env.example for the full list.
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: shelf-monitoring-db
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-shelf_monitoring}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # The backend runs `alembic upgrade head` the moment it starts, so "the
+    # container is up" is not a good enough signal — this gates on Postgres
+    # actually being ready to serve queries.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-shelf_monitoring}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  backend:
+    build:
+      # Repo root, not ./backend: the image also needs ml/ (the API imports
+      # ml/shelf_analyzer.py in-process), and a build context cannot reach
+      # above itself. See .dockerignore for what is kept out.
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: shelf-monitoring-backend
+    restart: always
+    environment:
+      - POSTGRES_SERVER=db
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-shelf_monitoring}
+      - POSTGRES_PORT=5432
+      - PROJECT_NAME=${PROJECT_NAME:-Retail Shelf Monitoring & Restocking Assistant}
+      - API_V1_STR=${API_V1_STR:-/api/v1}
+      # Both read from the repo-root .env. Passed by reference so the secrets
+      # stay out of the image and out of this file; `:-` keeps `compose up`
+      # working when they are unset (the app treats both as optional).
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - ./backend:/app
+      # Anonymous volumes: keep a host-built .venv / __pycache__ (Windows
+      # binaries, wrong interpreter) from shadowing the image's own.
+      - /app/.venv
+      - /app/__pycache__
+    depends_on:
+      db:
+        condition: service_healthy
+    # /health always answers 200 and reports dependency state in the body, so
+    # `curl -f` would call a degraded backend healthy — grep the body instead.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000${API_V1_STR:-/api/v1}/health | grep -q '\"status\": *\"healthy\"'"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      # To get the old hot-reloading Vite dev server back: add `target: dev`
+      # here, map "5173:5173" below, and restore the ./frontend:/app and
+      # /app/node_modules volumes.
+      args:
+        # Build-time, not runtime: Vite inlines import.meta.env.VITE_API_URL
+        # into the bundle during `npm run build`. As a container environment
+        # variable it would have no effect. This is the URL the browser calls,
+        # so it points at the published host port, not the compose hostname.
+        - VITE_API_URL=${VITE_API_URL:-http://localhost:8000/api/v1}
+    container_name: shelf-monitoring-frontend
+    restart: always
+    ports:
+      # nginx serves the built bundle on 80; published as 5173 to keep the
+      # familiar http://localhost:5173 entry point.
+      - "${FRONTEND_PORT:-5173}:80"
+    depends_on:
+      # Deliberately service_started, not service_healthy: the frontend is
+      # static files served by nginx and the browser calls the API directly, so
+      # a degraded backend should not stop the UI from coming up.
+      backend:
+        condition: service_started
+
+volumes:
+  pgdata:

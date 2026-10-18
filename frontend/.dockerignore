@@ -1,0 +1,19 @@
+# node_modules is reinstalled by `npm ci` inside the image; copying the host's
+# copy in would both bloat the context and risk platform-specific binaries.
+node_modules/
+dist/
+
+.env
+.env.local
+.env.*.local
+
+Dockerfile
+.dockerignore
+
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+npm-debug.log*
