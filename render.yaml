@@ -17,7 +17,7 @@ services:
     # The ML inference needs real memory: torch + OpenCV + a loaded YOLOv8 model do
     # not fit comfortably in the 512 MB Starter instance. Switch to `starter` only if
     # you accept occasional OOM restarts during analysis.
-    plan: standard
+    plan: free
     region: oregon
     dockerfilePath: ./backend/Dockerfile
     # Repo root, not backend/: the image also needs ml/ (see backend/Dockerfile).
@@ -31,10 +31,6 @@ services:
     autoDeploy: true
     # Uploaded shelf photos must survive redeploys; the container filesystem does not.
     # Requires a paid instance type (Render disks are not available on Free).
-    disk:
-      name: shelf-uploads
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       # "production" enforces SECRET_KEY and turns on the CORS warning.
       - key: ENVIRONMENT
@@ -60,6 +56,7 @@ services:
         value: https://.*\.vercel\.app
       # Persistent disk mount for capture images, served at /uploads.
       - key: UPLOAD_DIR
-        value: /var/data/uploads
+        value: /tmp/uploads
+
       - key: ALERT_EMAIL_ENABLED
         value: "true"
