@@ -26,7 +26,7 @@ services:
     # runs first (wait for Postgres -> alembic upgrade head) and then execs this.
     # Render does not guarantee shell expansion for dockerCommand, so ask for a shell
     # explicitly; that is what turns $PORT into the port Render assigned.
-    dockerCommand: /bin/sh -c 'exec uvicorn app.main:app --host 0.0.0.0 --port "$PORT"'
+    dockerCommand: uvicorn app.main:app --host 0.0.0.0 --port 10000
     healthCheckPath: /api/v1/health
     autoDeploy: true
     # Uploaded shelf photos must survive redeploys; the container filesystem does not.
