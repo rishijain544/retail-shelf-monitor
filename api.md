@@ -18,8 +18,23 @@ Private endpoints require a bearer JWT:
 Authorization: Bearer <access_token>
 ```
 
-Obtain a token from `POST /auth/signup` or `POST /auth/login`. Tokens are HS256 JWTs with
-`sub = user id` and expire after `ACCESS_TOKEN_EXPIRE_MINUTES` (default 1440 minutes = 24 h).
+Tokens are HS256 JWTs with `sub = user id` and a `purpose` claim; an `access` token expires
+after `ACCESS_TOKEN_EXPIRE_MINUTES` (default 1440 minutes = 24 h). It is issued by
+`POST /auth/mfa/verify` (or by `POST /auth/mfa/setup/confirm` when an account finishes
+enrolment), never by signup.
+
+Sign-in is two-step for ordinary accounts: a correct password yields a short-lived token
+that opens exactly one endpoint.
+
+| `purpose` | Lifetime | Accepted by |
+|-----------|----------|-------------|
+| `access` | 24 h | every private endpoint |
+| `mfa_challenge` | 5 min | `POST /auth/mfa/verify` only |
+| `mfa_setup` | 15 min | `POST /auth/mfa/setup/start`, `POST /auth/mfa/setup/confirm` only |
+
+A token with any other purpose (or with no `purpose` claim at all, such as one minted
+before this scheme existed) is rejected on every endpoint with `401` and
+`WWW-Authenticate: Bearer` — clients must sign in again.
 
 Missing, malformed, or expired tokens return:
 
@@ -51,9 +66,27 @@ FastAPI's standard shape:
 | `404` | Unknown id, or a report outside your store |
 | `409` | Email already registered |
 | `422` | Request body/query validation failed (Pydantic) |
+| `429` | Login/MFA lockout, or a verification-code resend inside the 60 s cooldown |
 | `500` | Unhandled server error (`{"detail": "Internal server error"}`) |
 | `502` | Alert channels configured but every one failed |
 | `503` | No alert channel configured |
+
+Auth failures add a machine-readable `code` next to the human `detail`:
+
+```json
+{ "detail": "Your email address is not verified yet. …", "code": "email_unverified" }
+```
+
+| `code` | Status | Meaning |
+|--------|--------|---------|
+| `email_unverified` | 403 | Password correct, address not confirmed |
+| `account_locked` | 429 | Too many failed passwords |
+| `mfa_locked` | 429 | Too many failed second factors |
+| `mfa_challenge_invalid` | 401 | Challenge token expired/forged |
+| `mfa_code_invalid` | 401 | Wrong TOTP/recovery code |
+| `resend_cooldown` | 429 | A verification email was just sent |
+| `invalid_password` | 401 | Recovery-code regeneration needs the password |
+| `invalid_totp_code` | 401 | Recovery-code regeneration needs a current TOTP |
 
 ### 1.4 Pagination
 
@@ -89,8 +122,14 @@ List endpoints return a generic envelope (not a bare array):
 |--------|------|------|---------|
 | GET | `/` *(server root)* | — | API banner and doc links |
 | GET | `/health` | — | API + database + alert-channel health |
-| POST | `/auth/signup` | — | Create store + owner, return token |
-| POST | `/auth/login` | — | Email/password login |
+| POST | `/auth/signup` | — | Create store + owner, email a verification code (no token) |
+| POST | `/auth/verify-email` | — | Confirm the address, return an `mfa_setup` token |
+| POST | `/auth/resend-verification` | — | New verification code (60 s cooldown) |
+| POST | `/auth/login` | — | Password step: session, MFA challenge, or enrolment |
+| POST | `/auth/mfa/verify` | challenge | TOTP or recovery code → `access` token |
+| POST | `/auth/mfa/setup/start` | setup | Issue an authenticator secret |
+| POST | `/auth/mfa/setup/confirm` | setup | Enable MFA, return recovery codes + `access` token |
+| POST | `/auth/mfa/recovery-codes/regenerate` | ✅ | Replace recovery codes (password + TOTP) |
 | GET | `/auth/me` | ✅ | Current account |
 | POST | `/captures/upload` | ✅ | Upload shelf image, start analysis |
 | GET | `/captures/{capture_id}/report` | ✅ | Poll analysis result |
@@ -125,6 +164,7 @@ a failing status code.
   "services": {
     "api": "healthy",
     "database": "healthy",
+    "schema": "head",
     "alert_slack": "not_configured",
     "alert_email": "healthy",
     "alert_email_transport": "smtp"
@@ -136,6 +176,7 @@ a failing status code.
 |-------|--------|
 | `status` | `healthy` \| `unhealthy` (only the database flips this) |
 | `database` | `healthy` \| `unhealthy: <reason>` |
+| `schema` | `head` \| `outdated: <rev> (head <rev>)` \| `not_initialised: <reason>` |
 | `alert_slack` | `healthy` \| `not_configured` |
 | `alert_email` | `healthy` \| `not_configured` \| `unhealthy: <reason>` |
 | `alert_email_transport` | `smtp` \| `api` \| `none` |
@@ -143,14 +184,20 @@ a failing status code.
 `not_configured` is not an error: it explains why an alert can be recorded without any
 message leaving the building.
 
+`database` reports reachability only — `SELECT 1` succeeds on a database with no tables. A
+schema that is not at head means every `POST /auth/signup` and `POST /auth/login` answers
+`500`, which is what `schema` exists to make visible.
+
 ---
 
 ## 4. Authentication
 
 ### `POST /auth/signup`
 
-Creates a store and its owner in one transaction. Returns `201` and a token, so the client
-does not need a separate login.
+Creates a store and its owner in one transaction, sets `email_verified = false`, mails a
+six-digit code to the address, and returns **`202` with no token**. A new account cannot
+sign in until that code is confirmed, so a typo'd or someone else's address never becomes
+a working login.
 
 **Request**
 
@@ -170,18 +217,49 @@ does not need a separate login.
 | `email` | trimmed + lower-cased; must look like `local@domain.tld`; ≤320 chars |
 | `password` | 8–72 chars |
 
-**Response `201`**
+**Response `202`**
 
 ```json
 {
-  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9…",
-  "token_type": "bearer",
-  "expires_in": 86400,
-  "user": { "id": 1, "email": "owner@example.com", "store_id": 1 }
+  "status": "verification_required",
+  "email": "owner@example.com",
+  "expires_in": 600
 }
 ```
 
 **Errors** — `409` email already registered; `422` validation.
+
+### `POST /auth/verify-email`
+
+Consumes the emailed code. At most 5 wrong guesses per code, after which it is burned; a
+code expires after `VERIFICATION_CODE_TTL_MINUTES` (default 10). A wrong code and an
+unknown address return the same `400`.
+
+```json
+{ "email": "owner@example.com", "code": "483920" }
+```
+
+**Response `200`**
+
+```json
+{
+  "status": "email_verified",
+  "setup_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9…",
+  "expires_in": 900
+}
+```
+
+`setup_token` is a `mfa_setup` token: it opens only the two `/auth/mfa/setup/*` routes.
+
+### `POST /auth/resend-verification`
+
+```json
+{ "email": "owner@example.com" }
+```
+
+**Response `202`** — `{ "status": "verification_sent" }` (also for an unknown address, so
+the endpoint is not an account oracle), or `{ "status": "already_verified" }`. A second
+request inside 60 seconds returns `429` with `code: "resend_cooldown"`.
 
 ### `POST /auth/login`
 
@@ -191,20 +269,109 @@ does not need a separate login.
 { "email": "owner@example.com", "password": "at-least-8-chars" }
 ```
 
-**Response `200`** — same `AuthTokenResponse` shape as signup.
+**Response `200`** — one of three shapes:
 
-**Errors** — `401` `"Incorrect email or password."` for both unknown email and wrong
-password (deliberately indistinguishable).
+```json
+{ "access_token": "…", "token_type": "bearer", "expires_in": 86400, "user": { "id": 1, "email": "owner@example.com", "store_id": 1, "email_verified": true, "mfa_enabled": false } }
+```
+
+```json
+{ "status": "mfa_required", "challenge_token": "…", "expires_in": 300 }
+```
+
+```json
+{ "status": "mfa_setup_required", "setup_token": "…", "expires_in": 900 }
+```
+
+The first is returned only for an `mfa_exempt` account (the shared demo login). Everything
+else must continue at `/auth/mfa/verify` or `/auth/mfa/setup/*`.
+
+**Errors** — `401` `"Invalid email or password."` for both unknown email and wrong password
+(deliberately indistinguishable); `403` `email_unverified`; `429` `account_locked` after
+5 failed passwords, for `LOCKOUT_MINUTES` (default 15).
+
+### `POST /auth/mfa/verify`
+
+```json
+{ "challenge_token": "…", "code": "483920" }
+```
+
+`code` is either the current 6-digit TOTP code or one of the printed recovery codes
+(`abcd-ef12`, case and separators ignored).
+
+**Response `200`** — the `AuthTokenResponse` above, with a real access token.
+
+Replay protection: a TOTP code is accepted once — its time step must be newer than the
+last accepted one. A recovery code is marked used. Five wrong codes lock the account for
+`LOCKOUT_MINUTES` (`429`, `code: "mfa_locked"`).
+
+### `POST /auth/mfa/setup/start`
+
+Requires a `mfa_setup` token. Generates a new secret, stores it encrypted (not yet
+enabled), and returns it once. Calling again replaces the pending secret.
+
+```json
+{
+  "secret": "JBSWY3DPEHPK3PXP",
+  "otpauth_uri": "otpauth://totp/ShelfMonitor:owner%40example.com?secret=…&issuer=ShelfMonitor",
+  "issuer": "ShelfMonitor",
+  "account": "owner@example.com"
+}
+```
+
+### `POST /auth/mfa/setup/confirm`
+
+Requires a `mfa_setup` token.
+
+```json
+{ "code": "483920" }
+```
+
+**Response `200`** — an `AuthTokenResponse` plus the recovery codes, which are shown
+**exactly once**.
+
+```json
+{
+  "access_token": "…",
+  "token_type": "bearer",
+  "expires_in": 86400,
+  "user": { "id": 1, "email": "owner@example.com", "store_id": 1, "email_verified": true, "mfa_enabled": true },
+  "recovery_codes": ["68ed-930c", "…10 total"]
+}
+```
+
+### `POST /auth/mfa/recovery-codes/regenerate`
+
+Requires an `access` token **and** both factors, so a stolen session cannot mint itself a
+permanent bypass.
+
+```json
+{ "password": "at-least-8-chars", "code": "483920" }
+```
+
+**Response `200`** — `{ "status": "recovery_codes_regenerated", "recovery_codes": [ … ] }`.
+All previous codes stop working.
 
 ### `GET /auth/me`
 
 **Response `200`**
 
 ```json
-{ "id": 1, "email": "owner@example.com", "store_id": 1 }
+{
+  "id": 1,
+  "email": "owner@example.com",
+  "store_id": 1,
+  "email_verified": true,
+  "mfa_enabled": true
+}
 ```
 
-**Errors** — `401` when the token is missing, expired, invalid, or the account was deleted.
+**Errors** — `401` when the token is missing, expired, invalid, of the wrong purpose, or the
+account was deleted.
+
+> There is deliberately **no endpoint that disables MFA**: a stolen password or session
+> must not be able to remove a second factor. The only recovery path for a lost device and
+> lost codes is the operator script `backend/scripts/reset_mfa.py <email>`.
 
 ---
 
@@ -673,6 +840,11 @@ compatibility but **ignored**.
 | `id` | int |
 | `email` | string |
 | `store_id` | int |
+| `email_verified` | bool |
+| `mfa_enabled` | bool |
+
+The MFA secret, its ciphertext, the replay step and the lockout counters are never
+returned.
 
 ### `ShelfReportResponse`
 
@@ -725,10 +897,12 @@ compatibility but **ignored**.
 ```bash
 BASE=http://localhost:8000/api/v1
 
-# 1. Create an account (returns a token)
-TOKEN=$(curl -s -X POST $BASE/auth/signup \
+# 1. Sign in. An ordinary account answers {"status": "mfa_required", "challenge_token": …}
+#    (then POST /auth/mfa/verify) or {"status": "mfa_setup_required", …} (enrol first).
+#    The mfa_exempt demo account returns a token directly:
+TOKEN=$(curl -s -X POST $BASE/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"store_name":"Demo Store","email":"owner@example.com","password":"password123"}' \
+  -d '{"email":"demo@shelfmonitor.test","password":"demo-2026-shelf"}' \
   | python -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
 
 # 2. Add a camera

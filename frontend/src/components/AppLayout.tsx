@@ -21,6 +21,7 @@ const NAV_ITEMS = [
   { to: '/alerts', label: 'Alerts', icon: Bell },
   { to: '/trends', label: 'Trends', icon: TrendingUp },
   { to: '/admin', label: 'Directory', icon: Settings },
+  { to: '/security', label: 'Security', icon: ShieldCheck },
 ];
 
 /**

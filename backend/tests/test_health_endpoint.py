@@ -54,6 +54,21 @@ def test_health_reports_healthy_api_and_database(client):
     assert body["services"]["database"] == "healthy"
 
 
+def test_health_reports_the_schema_state(client):
+    """A reachable database is not a usable one.
+
+    The deployed failure this guards against: PostgreSQL answered ``SELECT 1`` (so the
+    database card said Healthy) while no table existed, and every signup/login answered
+    500. The schema string has to distinguish the two. This fixture builds its tables
+    with ``create_all`` and never runs Alembic, which is exactly a database that is
+    *not* at head.
+    """
+    body = client.get(f"{BASE}/health").json()
+
+    assert "schema" in body["services"]
+    assert body["services"]["schema"].startswith("not_initialised")
+
+
 def test_health_reports_alert_channel_configuration(client, monkeypatch):
     """The dashboard must be able to say *why* no alert email arrives.
 

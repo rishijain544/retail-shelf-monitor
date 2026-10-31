@@ -2,12 +2,11 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ShieldCheck, Loader2, AlertCircle } from 'lucide-react';
 
-import { signup, type AuthTokenResponse } from '../api/client';
-import { useAuth } from '../hooks/useAuth';
+import { signup } from '../api/client';
+import { describeError } from '../api/errors';
 
 export default function SignupPage() {
   const navigate = useNavigate();
-  const { login: setAuth } = useAuth();
   const [storeName, setStoreName] = useState('');
   const [storeLocation, setStoreLocation] = useState('');
   const [email, setEmail] = useState('');
@@ -28,18 +27,17 @@ export default function SignupPage() {
     setLoading(true);
     setError(null);
     try {
-      const body: AuthTokenResponse = await signup({
+      const body = await signup({
         store_name: storeName,
         store_location: storeLocation.trim() || null,
         email,
         password,
       });
-      setAuth(body.user, body.access_token);
-      navigate('/', { replace: true });
+      // The account exists but is not a login yet: a code is on its way to the
+      // address, and the next screen confirms it. No token is issued here.
+      navigate('/verify-email', { state: { email: body.email } });
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : 'Signup failed. Please try again.',
-      );
+      setError(describeError(err));
     } finally {
       setLoading(false);
     }
@@ -76,7 +74,7 @@ export default function SignupPage() {
 
           <h1 className="text-2xl font-bold text-gray-900 mb-2">Sign up</h1>
           <p className="text-sm text-gray-500 mb-8">
-            Create your store and owner account.
+            Create your store and owner account. We&apos;ll email a code to confirm your address.
           </p>
 
           <form onSubmit={handleSubmit} className="space-y-5">

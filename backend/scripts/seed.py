@@ -35,6 +35,7 @@ from app.models.detection import Detection
 from app.models.shelf_report import ShelfReport
 from app.models.store import Store
 from app.models.user import User
+from app.services.demo_account import DEMO_EMAIL, DEMO_PASSWORD
 
 
 def get_or_create_store(db, name: str, location: str) -> tuple[Store, bool]:
@@ -299,8 +300,13 @@ def seed_database() -> None:
         # script puts into `users` (the auth endpoints themselves remain the safe
         # way to add real accounts). Re-running the script must not create a second
         # demo account.
-        DEMO_EMAIL = "demo@shelfmonitor.test"
-        DEMO_PASSWORD = "demo-2026-shelf"
+        #
+        # It is created `email_verified` and `mfa_exempt` on purpose: the address is a
+        # .test address that can never receive mail, and the credentials are published
+        # on the sign-in page, so an authenticator could not be shared with every
+        # visitor. These two flags are the only exemption from "verified email + second
+        # factor", and nothing in the API can set them — this script and
+        # scripts/reset_mfa.py are the only writers.
         demo_user = db.query(User).filter(User.email == DEMO_EMAIL).first()
         if demo_user is None:
             store1_db = db.query(Store).filter(Store.name == "Downtown Flagship Store").first()
@@ -310,6 +316,9 @@ def seed_database() -> None:
                 email=DEMO_EMAIL,
                 hashed_password=hash_password(DEMO_PASSWORD),
                 store_id=store1_db.id,
+                email_verified=True,
+                mfa_exempt=True,
+                mfa_enabled=False,
             )
             db.add(demo_user)
             db.flush()
@@ -317,7 +326,24 @@ def seed_database() -> None:
             print(f"  Password: {DEMO_PASSWORD}")
             print("  (Use src/pages/SignupPage or POST /auth/signup for your own accounts.)")
         else:
-            print(f"\nDemo account already exists: {DEMO_EMAIL} (skipped).")
+            # Older rows were seeded before verification/MFA existed; keep the demo
+            # login password-only so the published credentials still work.
+            changed = False
+            if not demo_user.email_verified:
+                demo_user.email_verified = True
+                changed = True
+            if not demo_user.mfa_exempt:
+                demo_user.mfa_exempt = True
+                changed = True
+            if demo_user.mfa_enabled:
+                demo_user.mfa_enabled = False
+                demo_user.mfa_secret_encrypted = None
+                demo_user.mfa_last_used_step = None
+                changed = True
+            print(
+                f"\nDemo account already exists: {DEMO_EMAIL} "
+                f"({'repaired' if changed else 'skipped'})."
+            )
 
         db.commit()
         print("\n" + "=" * 50)

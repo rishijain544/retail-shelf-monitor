@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 
 import { ApiError } from '../client';
-import { describeError, isNetworkError } from '../errors';
+import { describeAuthError, describeError, isLockoutError, isNetworkError } from '../errors';
 
 describe('isNetworkError', () => {
   it('recognises the browser-specific wording for a request that never completed', () => {
@@ -29,5 +29,41 @@ describe('describeError', () => {
     const message = describeError(new TypeError('Failed to fetch'));
     expect(message).toMatch(/server could not be reached/i);
     expect(message).not.toMatch(/failed to fetch/i);
+  });
+});
+
+describe('isLockoutError', () => {
+  it('is true only for the two 429 lockouts', () => {
+    expect(isLockoutError(new ApiError(429, '…', 'http://x', 'account_locked'))).toBe(true);
+    expect(isLockoutError(new ApiError(429, '…', 'http://x', 'mfa_locked'))).toBe(true);
+    expect(isLockoutError(new ApiError(429, '…', 'http://x', 'resend_cooldown'))).toBe(false);
+    expect(isLockoutError(new ApiError(401, '…', 'http://x', 'mfa_code_invalid'))).toBe(false);
+    expect(isLockoutError(new TypeError('Failed to fetch'))).toBe(false);
+  });
+});
+
+describe('describeAuthError', () => {
+  it('states the wait time from a lockout response', () => {
+    const message = describeAuthError(
+      new ApiError(
+        429,
+        'Too many failed sign-in attempts. Try again in 12 minute(s).',
+        'http://x',
+        'account_locked',
+      ),
+    );
+    expect(message).toBe('Too many attempts. Try again in 12 minutes.');
+  });
+
+  it('tells the user to sign in again when the challenge expired', () => {
+    expect(
+      describeAuthError(new ApiError(401, '…', 'http://x', 'mfa_challenge_invalid')),
+    ).toMatch(/expired.*sign in again/i);
+  });
+
+  it('falls back to the server message for anything else', () => {
+    expect(describeAuthError(new ApiError(401, 'That code is not valid.', 'http://x', 'mfa_code_invalid'))).toBe(
+      'That code is not valid.',
+    );
   });
 });

@@ -139,7 +139,7 @@ Rules the code follows:
 | Prefix | Router | Auth |
 |--------|--------|------|
 | `/health` | `health.py` | public |
-| `/auth` | `auth.py` | signup/login public, `/me` bearer |
+| `/auth` | `auth.py` | signup/verify/login/mfa public; `/me` and recovery-code regeneration bearer |
 | `/captures` | `captures.py` | bearer |
 | `/reports` | `reports.py` | bearer |
 | `/alerts` | `alerts.py` | bearer |
@@ -151,18 +151,64 @@ Static uploads are mounted **outside** the API prefix: `app.mount("/uploads", �
 ### 3.3 Authentication and tenancy
 
 - `POST /auth/signup` inserts `Store` + `User` in one transaction (`flush` → assign
-  `store_id` → `commit`); an `IntegrityError` rolls both back.
+  `store_id` → `commit`); an `IntegrityError` rolls both back. It returns `202` with **no
+  token**: the new account is `email_verified = false` until the mailed code is confirmed
+  by `POST /auth/verify-email`.
 - Passwords: bcrypt via passlib; input truncated to 72 bytes consistently on hash and
   verify.
-- Tokens: HS256 JWT, `sub` = user id string, `exp` from
-  `ACCESS_TOKEN_EXPIRE_MINUTES` (default 24 h). `SECRET_KEY` is required in
+- Tokens: HS256 JWT carrying `sub` (user id string) and a `purpose` claim.
+  `purpose="access"` expires after `ACCESS_TOKEN_EXPIRE_MINUTES` (default 24 h);
+  `mfa_challenge` lives 5 minutes and `mfa_setup` 15. `SECRET_KEY` is required in
   production/staging; in development an ephemeral random key is generated (tokens die on
-  restart, with a warning).
-- `get_current_user` decodes the bearer token and loads the `User` row, returning `401`
-  with `WWW-Authenticate: Bearer` for every failure mode.
+  restart, with a warning). A token with no `purpose` — anything issued before purposes
+  existed — is treated as invalid everywhere.
+- `get_current_user` accepts **only** `purpose="access"` and loads the `User` row,
+  returning `401` with `WWW-Authenticate: Bearer` for every failure mode. The challenge and
+  setup tokens have their own dependencies in the same module (`get_mfa_challenge_user`,
+  `get_mfa_setup_user`), used by nothing but their own endpoint — so an intermediate token
+  cannot reach `/reports`, `/alerts`, `/cameras`, `/captures` or `/auth/me` at all.
 - `get_current_active_store` is defined for store-scoped dependencies and returns the
   user's store or `403`; the current endpoints call `_assert_camera_belongs_to_user`
   directly when they need a camera boundary.
+- The demo account advertised on the sign-in page (`demo@shelfmonitor.test`) is created by
+  `app/services/demo_account.py` whenever `SEED_DEMO_ACCOUNT` resolves to true — the
+  default outside `production`/`staging`, because the sign-in page always shows those
+  credentials — and by `scripts/seed.py` for local sample data. It is an ordinary `users`
+  row in its own `Demo Store`, so it gets no privileges a signed-up account would not have.
+  It is created `email_verified = true` and `mfa_exempt = true`: its `.test` address can
+  never receive mail and the public cannot hold its authenticator. `ensure_demo_account`
+  repairs an existing demo row the same way, so upgrading does not turn the one-click demo
+  login into a wall. `mfa_exempt` is not settable through any API.
+
+**Multi-factor flow.** Both factors are enforced in one place, so a new endpoint cannot
+forget one:
+
+```
+signup ────────────► 202 {verification_required} + emailed 6-digit code
+verify-email ──────► 200 {setup_token}            (purpose=mfa_setup, 15 min)
+mfa/setup/start ───► secret + otpauth:// URI      (pending, encrypted)
+mfa/setup/confirm ─► 200 access token + 10 recovery codes (shown once)
+
+login (password ok) ─┬─ mfa_enabled  ─► 200 {mfa_required, challenge_token}  (5 min)
+                     ├─ not enrolled ─► 200 {mfa_setup_required, setup_token}
+                     └─ mfa_exempt   ─► 200 access token
+mfa/verify ────────► access token      (TOTP or recovery code, replay-checked)
+```
+
+- Verification codes are stored as `HMAC-SHA256` digests keyed from the signing key and
+  compared with `hmac.compare_digest`; 5 wrong guesses burn the code and resends are
+  limited to one per 60 seconds (`app/services/verification.py`).
+- TOTP secrets are Fernet-encrypted at rest with `MFA_ENCRYPTION_KEY`; the accepted time
+  step is recorded so a code cannot be replayed inside its 30-second window
+  (`app/services/mfa.py`).
+- Five wrong passwords lock sign-in, and five wrong second factors lock MFA, each for
+  `LOCKOUT_MINUTES` (default 15). A locked account answers `429` with a `Retry-After`
+  header and a machine-readable `code`.
+- **No endpoint disables MFA.** `scripts/reset_mfa.py <email>` is the operator recovery
+  path for a lost device and lost codes; there is no password-reset flow yet.
+- Mail goes through the same `email_service` transports as alerts
+  (`send_verification_code`), and a delivery failure never fails the signup — the row is
+  created and the user can request a new code.
 
 Tenant boundary:
 
@@ -294,16 +340,27 @@ the setup screen.
 | `ALERT_EMAIL_TO`, `ALERT_EMAIL_ENABLED` | Recipient override / master switch |
 | `CORS_ORIGINS`, `CORS_ORIGIN_REGEX` | Browser origins allowed to call the API |
 | `SECRET_KEY`, `ACCESS_TOKEN_EXPIRE_MINUTES` | JWT signing and lifetime |
-| `ENVIRONMENT` | `development` \| `production` \| `staging` |
+| `MFA_ENCRYPTION_KEY` | Fernet key encrypting TOTP secrets; required in strict environments |
+| `MFA_ISSUER_NAME` | Label shown in the authenticator app (default `ShelfMonitor`) |
+| `VERIFICATION_CODE_TTL_MINUTES`, `MAX_CODE_ATTEMPTS`, `LOCKOUT_MINUTES` | Signup-code lifetime, wrong-guess limit (5), lockout length (15 min) |
+| `DEV_LOG_VERIFICATION_CODES` | Development only: print a signup code when **no** email transport is configured |
+| `ENVIRONMENT` | `development` \| `production` \| `staging` (strict environments enforce `SECRET_KEY` and `MFA_ENCRYPTION_KEY`) |
+| `AUTO_MIGRATE` | Apply the migration chain at startup (default `true`; not gated on `ENVIRONMENT`) |
+| `SEED_DEMO_ACCOUNT` | Create the demo account advertised on the sign-in page when missing (default: on outside `production`/`staging`; `render.yaml` sets it explicitly) |
 
 Credentials are stripped of quotes/whitespace on load; strict environments refuse to
-start without a strong `SECRET_KEY`.
+start without a strong `SECRET_KEY` and a valid `MFA_ENCRYPTION_KEY`. A malformed
+`MFA_ENCRYPTION_KEY` aborts startup in every environment — silently ignoring an
+operator-supplied key would encrypt secrets with something the next deploy cannot
+reproduce. Outside strict environments an unset key is derived from `SECRET_KEY` with a
+warning on each boot, so local development needs only one secret.
 
 ### 3.9 Python dependencies
 
 `fastapi`, `uvicorn[standard]`, `sqlalchemy`, `alembic`, `pydantic-settings`,
 `psycopg2-binary`, `python-dotenv`, `httpx`, `anthropic`, `python-multipart`, `passlib`,
-`bcrypt` pinned `<4.1` (passlib 1.7.4 cannot load newer bcrypt), `PyJWT`.
+`bcrypt` pinned `<4.1` (passlib 1.7.4 cannot load newer bcrypt), `PyJWT`, `pyotp` (TOTP),
+`cryptography` (Fernet).
 
 ---
 
@@ -316,15 +373,26 @@ start without a strong `SECRET_KEY`.
 - **Lazy loading** — `Trends` is `React.lazy` so Recharts stays out of the Dashboard
   bundle.
 - **Auth state** — `useAuth` keeps a single source of truth in
-  `localStorage["sm:auth:state"]` and notifies module-level listeners, so hook instances
-  and the transport layer stay in sync. `AuthGate` calls `GET /auth/me` on mount to
-  validate the persisted token.
+  `localStorage["sm:auth:state"]` (the **access** token only) and notifies module-level
+  listeners, so hook instances and the transport layer stay in sync. `AuthGate` calls
+  `GET /auth/me` on mount to validate the persisted token and redirects to `/login`
+  synchronously when there is none — a half-finished sign-in never renders protected
+  content.
+- **Half-finished sign-in** — `useMfaSession` holds the `mfa_challenge` / `mfa_setup`
+  token in a module variable, never in storage. It is not a session, so a reload drops it
+  and the flow restarts at `/login` (an expired token is dropped on read). The demo
+  account is `mfa_exempt`, so its one-click login returns a real token and skips all of
+  this.
 - **HTTP** — one typed client (`src/api/client.ts`): `request()` prefixes
   `API_BASE_URL` (default `http://localhost:8000/api/v1`), injects
-  `Authorization: Bearer <token>` from storage, throws `ApiError(status, detail)` for
-  non-2xx, and leaves multipart `Content-Type` to the browser.
+  `Authorization: Bearer <token>` from storage (an explicit per-call header wins, which is
+  how the setup token is sent), throws `ApiError(status, detail, url, code)` for non-2xx,
+  and leaves multipart `Content-Type` to the browser. `code` is the machine-readable
+  reason (`account_locked`, `mfa_locked`, `mfa_challenge_invalid`, `email_unverified`).
 - **Errors** — `src/api/errors.ts` provides `describeError` / `isAbortError` for
-  consistent user-facing messages and abort handling.
+  consistent user-facing messages and abort handling, plus `describeAuthError` and
+  `isLockoutError`, which turn a `429` into "Too many attempts. Try again in N minutes."
+  using the wait time the server reports.
 - **Styling** — Tailwind CSS utility classes; icons from `lucide-react`; charts from
   `recharts`.
 - **No global store** — each page owns its data with `useState`/`useEffect`,
@@ -334,7 +402,12 @@ start without a strong `SECRET_KEY`.
 
 | Route | Page | Responsibilities |
 |-------|------|------------------|
-| `/login`, `/signup` | `LoginPage`, `SignupPage` | Credentials, one-click demo login, redirect to dashboard |
+| `/login` | `LoginPage` | Password step; routes to `/login/mfa` (challenge) or `/login/mfa-setup` (enrolment), or straight to the dashboard for the demo account. One-click demo login lives here |
+| `/login/mfa` | `MfaCodePage` | 6-digit authenticator code or a recovery code → access token |
+| `/login/mfa-setup` | `MfaSetupPage` | Mandatory enrolment: install the app, scan the QR code (rendered in-browser with `qrcode.react` from the `otpauth://` URI) or copy the manual key, confirm a code, then save 10 recovery codes before Continue unlocks |
+| `/signup` | `SignupPage` | Store + owner form; `202` with no token, then redirects to `/verify-email` |
+| `/verify-email` | `VerifyEmailPage` | 6-digit code, resend with a 60 s countdown matching the server cooldown |
+| `/security` | `Security` | Shows whether two-factor is on and regenerates recovery codes (password + current code) |
 | `/` | `Dashboard` | Upload capture, poll pipeline, list/filter reports, CSV export |
 | `/reports/:id` | `ShelfDetail` | Image, detections overlay, fill/urgency/summary/action, previous fill |
 | `/alerts` | `Alerts` | Alert feed, test alert, email/SMTP configuration dialog |
@@ -402,8 +475,19 @@ frontend (nginx serving the built SPA, published on :5173)
 
 ### 6.3 Environment separation
 
-`ENVIRONMENT` gates strict configuration checks only. There is no separate staging
-deployment definition in the repository.
+`ENVIRONMENT` gates the strict configuration checks (`SECRET_KEY`). There is no separate
+staging deployment definition in the repository.
+
+Managed hosts start the container with their own command, so the image ENTRYPOINT (wait
+for Postgres → `alembic upgrade head`) is not guaranteed to run. The app therefore applies
+the migration chain itself from its lifespan hook (`app/services/schema.py`) before
+serving traffic, controlled by `AUTO_MIGRATE` (default on, **not** gated on
+`ENVIRONMENT`): a database without the `users` table is otherwise invisible — `/health`
+answers `200` because `SELECT 1` needs no schema, while every signup and login answers
+`500`. Gating this on `ENVIRONMENT=production` was itself a production outage: a service
+created outside `render.yaml` ran with the development default, never migrated, and every
+sign-in answered `500 Internal server error`. The step is idempotent, logged on failure,
+and reported by `GET /health` as `services.schema`.
 
 ### 6.4 Vercel frontend + Render API (hosted split)
 
@@ -433,6 +517,9 @@ Configuration that makes it work:
 - The Render service is a single instance: background tasks and the upload share a process.
 - Uploads are still served by the API's `/uploads` mount, so the frontend's relative image
   URLs keep working unchanged.
+- The app migrates on startup instead of trusting the ENTRYPOINT (see §6.3), and
+  `SEED_DEMO_ACCOUNT` creates the demo account the sign-in page advertises, so a freshly
+  deployed, unseeded Neon database can still be logged into.
 
 ---
 

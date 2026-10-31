@@ -109,13 +109,17 @@ productive immediately and their data is isolated from other stores.
 
 | ID | Requirement |
 |----|-------------|
-| FR-A1 | `POST /api/v1/auth/signup` creates a store + owner atomically and returns a JWT, `expires_in`, and the user. |
+| FR-A1 | `POST /api/v1/auth/signup` creates a store + owner atomically and returns `202 {status: verification_required}` — **no token** until the emailed code is confirmed. |
 | FR-A2 | Duplicate email returns `409`; emails are trimmed and lower-cased before lookup/insert. |
 | FR-A3 | `POST /api/v1/auth/login` returns `401` for an unknown email or wrong password, with the same message and comparable timing (dummy-hash verification prevents user enumeration). |
-| FR-A4 | `GET /api/v1/auth/me` validates the bearer token and returns `{id, email, store_id}`. |
+| FR-A4 | `GET /api/v1/auth/me` validates a `purpose=access` bearer token and returns `{id, email, store_id, email_verified, mfa_enabled}`. |
 | FR-A5 | Passwords are stored only as bcrypt hashes (max 72 bytes, truncated consistently). |
-| FR-A6 | Access tokens are HS256 JWTs with `sub = user id`, `iat`, `exp` (default 1440 minutes). |
-| FR-A7 | In `production`/`staging`, a missing or `< 32`-character `SECRET_KEY` aborts startup. |
+| FR-A6 | Access tokens are HS256 JWTs with `sub = user id`, a `purpose` claim (`access`, `mfa_challenge`, `mfa_setup`), `iat`, `exp` (default 1440 minutes for `access`). |
+| FR-A7 | In `production`/`staging`, a missing or `< 32`-character `SECRET_KEY`, or a missing/invalid `MFA_ENCRYPTION_KEY`, aborts startup. |
+| FR-A8 | A signup address is only usable after a 6-digit code mailed to it is confirmed (10-minute TTL, 5 attempts, 60-second resend cooldown). |
+| FR-A9 | A password alone never yields a session: an enrolled account must present a TOTP code (`valid_window=1`, one use per time step) or a single-use recovery code; an unenrolled account must enrol first. |
+| FR-A10 | 5 failed passwords or 5 failed second factors lock the account for 15 minutes. No endpoint disables MFA; `scripts/reset_mfa.py <email>` is the operator reset. |
+| FR-A11 | Only the shared demo account is `mfa_exempt`; the flag is settable by seed/admin scripts and by no API call. |
 
 ### 6.2 Capture ingestion
 
@@ -161,7 +165,7 @@ productive immediately and their data is isolated from other stores.
 |----|-------------|
 | FR-D1 | `GET /api/v1/stores` lists all stores (reference data); `POST /api/v1/stores` creates one. |
 | FR-D2 | `GET /api/v1/cameras` returns only the caller's store's cameras; `POST /api/v1/cameras` always uses the caller's `store_id`. |
-| FR-D3 | `GET /api/v1/health` always answers `200` and reports `api`, `database`, `alert_slack`, `alert_email`, and `alert_email_transport`. |
+| FR-D3 | `GET /api/v1/health` always answers `200` and reports `api`, `database`, `schema`, `alert_slack`, `alert_email`, and `alert_email_transport`. |
 | FR-D4 | A failed email configuration or delivery is visible as `unhealthy: <reason>`, not hidden behind a green badge. |
 
 ---

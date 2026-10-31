@@ -22,10 +22,14 @@ services:
     dockerfilePath: ./backend/Dockerfile
     # Repo root, not backend/: the image also needs ml/ (see backend/Dockerfile).
     dockerContext: .
-    # Override the development CMD (which uses --reload). The image's ENTRYPOINT still
-    # runs first (wait for Postgres -> alembic upgrade head) and then execs this.
-    # Render does not guarantee shell expansion for dockerCommand, so ask for a shell
-    # explicitly; that is what turns $PORT into the port Render assigned.
+    # Override the development CMD (which uses --reload). Render does not guarantee
+    # shell expansion for dockerCommand, so ask for a shell explicitly; that is what
+    # turns $PORT into the port Render assigned.
+    # NOTE: this value replaces the image CMD, and managed hosts do not promise that
+    # the image ENTRYPOINT (which waits for Postgres and runs `alembic upgrade head`)
+    # runs at all. The app therefore applies the migration chain itself in its lifespan
+    # hook (AUTO_MIGRATE, on by default and independent of ENVIRONMENT) — see
+    # backend/app/services/schema.py.
     dockerCommand: /bin/sh -c 'exec uvicorn app.main:app --host 0.0.0.0 --port "$PORT"'
     healthCheckPath: /api/v1/health
     autoDeploy: true
@@ -37,6 +41,9 @@ services:
       sizeGB: 1
     envVars:
       # "production" enforces SECRET_KEY and turns on the CORS warning.
+      # A service created from the Render dashboard instead of this blueprint gets
+      # neither variable: set both by hand, or JWTs are re-keyed on every restart and
+      # the demo account is created without being asked for.
       - key: ENVIRONMENT
         value: production
       # Generated once by Render and kept stable, so JWTs stay valid across restarts.
@@ -62,4 +69,10 @@ services:
       - key: UPLOAD_DIR
         value: /var/data/uploads
       - key: ALERT_EMAIL_ENABLED
+        value: "true"
+      # Creates the demo account advertised on the sign-in page when the database has
+      # none, so "Try Demo Account" works on a freshly deployed, unseeded database.
+      # Explicit because ENVIRONMENT=production would leave it off by default. Set to
+      # "false" to keep a known-password account out of a real deployment.
+      - key: SEED_DEMO_ACCOUNT
         value: "true"

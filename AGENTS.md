@@ -257,6 +257,20 @@ run (missing weights, no DB, no network), say so explicitly rather than implying
 - Treat uploaded files as untrusted: validate content type, generate the stored filename,
   and never execute or serve them from a path derived from user input.
 
+### Auth rules (email verification + MFA)
+
+- Every JWT carries a `purpose` claim. `get_current_user` accepts only `access`; the
+  `mfa_challenge` and `mfa_setup` tokens are valid on exactly one endpoint each. Never add
+  a route that accepts a token by decoding it directly without checking the purpose.
+- Signup must not return a token. An account is a login only once `email_verified` is true.
+- **No endpoint may disable MFA** or set `mfa_exempt`. Those two invariants are what make
+  the second factor meaningful; `scripts/reset_mfa.py` is the operator escape hatch.
+- One-time codes are never logged or returned twice: signup codes are keyed
+  `HMAC-SHA256` digests compared with `hmac.compare_digest`, TOTP secrets are Fernet
+  ciphertext, recovery codes are bcrypt digests shown once at creation.
+- New auth state lives on `users` (see [database.md](database.md)); compare timestamps
+  through `app/core/clock.as_utc()` because SQLite returns naive datetimes.
+
 ### Email/alert credential rules
 
 - One installation-wide transport, not per-user credentials.

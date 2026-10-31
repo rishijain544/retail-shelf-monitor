@@ -9,7 +9,11 @@ import ShelfDetail from './pages/ShelfDetail';
 import Alerts from './pages/Alerts';
 import Admin from './pages/Admin';
 import LoginPage from './pages/LoginPage';
+import MfaCodePage from './pages/MfaCodePage';
+import MfaSetupPage from './pages/MfaSetupPage';
+import Security from './pages/Security';
 import SignupPage from './pages/SignupPage';
+import VerifyEmailPage from './pages/VerifyEmailPage';
 
 /**
  * Trends is the only page that pulls in Recharts, which is roughly two thirds of
@@ -56,9 +60,19 @@ function AuthGate({ children }: { children: React.ReactNode }) {
 export default function App() {
   return (
     <Routes>
-      {/* Standalone auth pages — no AppLayout shell */}
+      {/*
+       * Standalone auth pages — no AppLayout shell.
+       *
+       * /login/mfa and /login/mfa-setup are the two half-finished states: the
+       * challenge and setup tokens live in memory only (useMfaSession), so these
+       * pages redirect to /login when there is no pending flow — including after a
+       * refresh, which deliberately restarts the sign-in.
+       */}
       <Route path="/login" element={<LoginPage />} />
+      <Route path="/login/mfa" element={<MfaCodePage />} />
+      <Route path="/login/mfa-setup" element={<MfaSetupPage />} />
       <Route path="/signup" element={<SignupPage />} />
+      <Route path="/verify-email" element={<VerifyEmailPage />} />
 
       {/* Authenticated app shell */}
       <Route
@@ -72,6 +86,7 @@ export default function App() {
         <Route path="reports/:id" element={<ShelfDetail />} />
         <Route path="alerts" element={<Alerts />} />
         <Route path="admin" element={<Admin />} />
+        <Route path="security" element={<Security />} />
         <Route
           path="trends"
           element={

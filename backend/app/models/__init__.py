@@ -8,6 +8,8 @@ from app.models.shelf_report import ShelfReport
 from app.models.alert import Alert
 from app.models.user import User
 from app.models.email_setting import EmailSetting
+from app.models.email_verification_code import EmailVerificationCode
+from app.models.mfa_recovery_code import MfaRecoveryCode
 
 __all__ = [
     "Base",
@@ -20,4 +22,6 @@ __all__ = [
     "Alert",
     "User",
     "EmailSetting",
+    "EmailVerificationCode",
+    "MfaRecoveryCode",
 ]

@@ -81,6 +81,23 @@ class Settings(BaseSettings):
     # configuration checks at the bottom of this class.
     ENVIRONMENT: str = "development"
 
+    # Bring the database schema up to date at startup (see app/services/schema.py).
+    # On by default and deliberately NOT gated on ENVIRONMENT: a managed host that
+    # starts uvicorn without the container ENTRYPOINT never runs `alembic upgrade head`,
+    # and a deployment created outside render.yaml has no ENVIRONMENT=production to
+    # trigger it — which is exactly how the sign-in page ended up answering 500
+    # "Internal server error" (`relation "users" does not exist`). It is a no-op once
+    # the database is at head. The test suite turns it off (tests/conftest.py) because
+    # every test builds its own throwaway schema.
+    AUTO_MIGRATE: bool = True
+
+    # Create the demo account advertised on the sign-in page when it is missing.
+    # Unset (the default) means "yes outside production/staging" — the sign-in page
+    # always shows the demo credentials, so a development-like deployment has to have
+    # that row or its demo button answers 401. Set it to "false" to keep a
+    # known-password account off any deployment, or "true" to have one in production.
+    SEED_DEMO_ACCOUNT: Optional[bool] = None
+
     # Browser origins allowed to call the API. Comma-separated, e.g.
     #   CORS_ORIGINS=https://shelf-monitor.vercel.app
     # The default "*" mirrors the old hardcoded policy and is development-only: with
@@ -110,7 +127,33 @@ class Settings(BaseSettings):
     # How long an issued access token stays valid.
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 1 day
 
-    @field_validator("RESEND_API_KEY", "ALERT_EMAIL_TO", "SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM", "EMAIL_FROM", "EMAIL_API_URL", mode="before")
+    # Multi-factor authentication.
+    #
+    # MFA_ENCRYPTION_KEY is a Fernet key used to encrypt each account's TOTP secret
+    # at rest; a leaked database dump must not hand over authenticator seeds. It is
+    # deliberately separate from SECRET_KEY (rotating the JWT key must not orphan
+    # every enrolled authenticator). Generate one with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # Required in production/staging, like SECRET_KEY. Outside those environments it
+    # falls back to a key derived from SECRET_KEY and warns loudly on every boot, so
+    # local development keeps working without a second secret to generate.
+    MFA_ENCRYPTION_KEY: Optional[str] = None
+    # Shown as the account label in the authenticator app ("ShelfMonitor: you@shop.com").
+    MFA_ISSUER_NAME: str = "ShelfMonitor"
+    # How long a signup's emailed verification code stays valid.
+    VERIFICATION_CODE_TTL_MINUTES: int = 10
+    # Wrong guesses allowed per verification code / per MFA enrolment before the code
+    # is burned and 5 wrong codes lock an account for LOCKOUT_MINUTES.
+    MAX_CODE_ATTEMPTS: int = 5
+    # Length of a temporary login/MFA lockout after MAX_CODE_ATTEMPTS failures.
+    LOCKOUT_MINUTES: int = 15
+    # Development aid: print a signup verification code to the log when no email
+    # transport is configured at all. Never logs a code when mail can be sent, and
+    # never logs the code for an existing deployment that turns this on by accident —
+    # it is off by default and documented as local-only.
+    DEV_LOG_VERIFICATION_CODES: bool = False
+
+    @field_validator("RESEND_API_KEY", "ALERT_EMAIL_TO", "SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM", "EMAIL_FROM", "EMAIL_API_URL", "MFA_ENCRYPTION_KEY", mode="before")
     @classmethod
     def _strip_credentials(cls, value):
         """Tolerate quotes, stray CR and trailing spaces around a pasted credential.
@@ -148,6 +191,13 @@ class Settings(BaseSettings):
     def IS_STRICT_ENVIRONMENT(self) -> bool:
         return self.ENVIRONMENT.strip().lower() in _STRICT_ENVIRONMENTS
 
+    @property
+    def seed_demo_account(self) -> bool:
+        """Whether to create the demo account, applying the not-in-production default."""
+        if self.SEED_DEMO_ACCOUNT is not None:
+            return self.SEED_DEMO_ACCOUNT
+        return not self.IS_STRICT_ENVIRONMENT
+
     @model_validator(mode="after")
     def _check_auth_secrets(self) -> "Settings":
         """Fail loudly rather than silently signing tokens with a weak secret."""
@@ -165,6 +215,42 @@ class Settings(BaseSettings):
                 f"SECRET_KEY is too short ({len(self.SECRET_KEY)} chars) for ENVIRONMENT="
                 f"'{self.ENVIRONMENT}'; use at least 32 characters of entropy."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _check_mfa_key(self) -> "Settings":
+        """Refuse to start with a missing or malformed TOTP encryption key.
+
+        A valid Fernet key is required rather than optional-on-first-use: without one
+        every enrolled authenticator would be unreadable and each affected account
+        would need scripts/reset_mfa.py. Failing at boot is loud and fixable; failing
+        at the first MFA login is neither.
+        """
+        key = (self.MFA_ENCRYPTION_KEY or "").strip()
+        if not key:
+            if not self.IS_STRICT_ENVIRONMENT:
+                # security.py derives one from SECRET_KEY and warns on every boot.
+                return self
+            raise RuntimeError(
+                f"MFA_ENCRYPTION_KEY must be set when ENVIRONMENT='{self.ENVIRONMENT}'. "
+                "Generate one with: python -c \"from cryptography.fernet import Fernet; "
+                "print(Fernet.generate_key().decode())\" and put it in backend/.env "
+                "(never commit it). Losing it makes every enrolled authenticator unreadable."
+            )
+
+        # An operator-supplied key must be usable; silently falling back to the derived
+        # development key would encrypt secrets with something than the next deploy will
+        # not be able to reproduce.
+        from cryptography.fernet import Fernet  # local import: keeps config import cheap
+
+        try:
+            Fernet(key.encode())
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError(
+                "MFA_ENCRYPTION_KEY is not a valid Fernet key. Generate a new one with: "
+                "python -c \"from cryptography.fernet import Fernet; "
+                f"print(Fernet.generate_key().decode())\" (reason: {exc})"
+            ) from exc
         return self
 
     @property

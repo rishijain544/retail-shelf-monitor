@@ -13,3 +13,6 @@ passlib>=1.7.4
 # >=4.1 backend, so bcrypt 5.x would break password hashing at import time.
 bcrypt>=4.0.1,<4.1
 PyJWT>=2.8.0
+# TOTP (authenticator apps) and Fernet encryption for the stored MFA secrets.
+pyotp>=2.9.0
+cryptography>=42.0.0

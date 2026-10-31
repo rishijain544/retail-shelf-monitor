@@ -83,6 +83,22 @@ describe('LoginPage demo access', () => {
     expect(await screen.findByText('DASHBOARD STUB')).toBeInTheDocument();
   });
 
+  it('explains a missing demo account instead of blaming the password', async () => {
+    // A deployment with SEED_DEMO_ACCOUNT off has no demo row: the login answers 401 even
+    // though the button supplied the advertised credentials itself. "Incorrect email or
+    // password" would read like a bug, so the page points at signup instead.
+    const user = userEvent.setup();
+    vi.mocked(client.login).mockRejectedValueOnce(
+      new client.ApiError(401, 'Incorrect email or password.', 'http://api.test/auth/login'),
+    );
+    renderLogin();
+
+    await user.click(screen.getByRole('button', { name: /try demo account/i }));
+
+    expect(await screen.findByText(/has no demo account yet/i)).toBeInTheDocument();
+    expect(screen.queryByText(/incorrect email or password/i)).not.toBeInTheDocument();
+  });
+
   it('surfaces a failed demo sign-in instead of silently doing nothing', async () => {
     const user = userEvent.setup();
     vi.mocked(client.login).mockRejectedValueOnce(new TypeError('Failed to fetch'));

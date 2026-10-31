@@ -75,6 +75,8 @@ Cardinality summary:
 | `captures` → `detections` | 1 : N | delete-orphan |
 | `captures` → `shelf_reports` | 1 : N | delete-orphan |
 | `shelf_reports` → `alerts` | 1 : N | delete-orphan |
+| `users` → `email_verification_codes` | 1 : N | delete-orphan |
+| `users` → `mfa_recovery_codes` | 1 : N | delete-orphan |
 
 Database-level FKs use `ON DELETE CASCADE`, so integrity holds even for rows deleted
 outside the ORM.
@@ -104,12 +106,36 @@ outside the ORM.
 | `hashed_password` | String | no | — | bcrypt hash; never returned |
 | `store_id` | Integer | no | — | FK → `stores.id`, `ON DELETE CASCADE`, indexed |
 | `created_at` | DateTime(tz) | no | `now()` | Server default |
+| `email_verified` | Boolean | no | `false` | Address proven by an emailed code |
+| `mfa_enabled` | Boolean | no | `false` | Authenticator enrolled and confirmed |
+| `mfa_secret_encrypted` | String | yes | `NULL` | Fernet ciphertext of the base32 TOTP secret |
+| `mfa_last_used_step` | Integer | yes | `NULL` | Last accepted TOTP step (replay protection) |
+| `mfa_exempt` | Boolean | no | `false` | Password-only account (demo); never settable via the API |
+| `failed_login_attempts` | Integer | no | `0` | Consecutive wrong passwords |
+| `login_locked_until` | DateTime(tz) | yes | `NULL` | Password lockout expiry |
+| `failed_mfa_attempts` | Integer | no | `0` | Consecutive wrong second factors |
+| `mfa_locked_until` | DateTime(tz) | yes | `NULL` | MFA lockout expiry |
 
 - One row per dashboard login. Signup creates a new store per account, so the normal
   flow is one account per store; the schema does not forbid several, and alert delivery
   emails every account in the store.
 - Email normalisation happens in the Pydantic schema before validation, so
   `Owner@Shop.com` and `owner@shop.com` are the same account.
+- **`mfa_secret_encrypted` is ciphertext, not a secret.** It is encrypted with
+  `MFA_ENCRYPTION_KEY` (Fernet), so a database dump alone does not yield working
+  authenticator seeds. Losing the key makes every enrolled account unreadable; the only
+  fix is `backend/scripts/reset_mfa.py <email>`. The plaintext base32 secret is returned
+  exactly once, by `POST /auth/mfa/setup/start`.
+- **`mfa_exempt` is not writable through any API.** Only `scripts/seed.py`,
+  `app/services/demo_account.py` and `scripts/reset_mfa.py` set it. The shared demo account
+  is exempt because its `.test` address cannot receive mail and the public cannot hold its
+  authenticator.
+- **Lockout counters reset on success**, and the counter is zeroed when a lockout is set,
+  so the account gets a full set of attempts once the lockout expires.
+- Timestamps are compared through `app/core/clock.as_utc()`: SQLite returns naive datetimes
+  for `DateTime(timezone=True)`, and comparing one to an aware `now` raises `TypeError`.
+- The migration grandfathered existing rows with `email_verified = true` and left
+  `mfa_enabled = false`, so an upgrade never locks out a live deployment.
 
 ### 3.3 `cameras`
 
@@ -243,6 +269,42 @@ Rules:
 No API endpoint or pipeline reads or writes this table today; it is a placeholder for
 SKU-level inventory.
 
+### 3.10 `email_verification_codes`
+
+| Column | Type | Null | Default | Notes |
+|--------|------|------|---------|-------|
+| `id` | Integer | no | autoincrement | PK, indexed |
+| `user_id` | Integer | no | — | FK → `users.id`, `ON DELETE CASCADE`, indexed |
+| `code_hash` | String(64) | no | — | `HMAC-SHA256(pepper, "<user_id>:<code>")` hex |
+| `expires_at` | DateTime(tz) | no | — | `created_at + VERIFICATION_CODE_TTL_MINUTES` |
+| `attempts` | Integer | no | `0` | Wrong guesses; at `MAX_CODE_ATTEMPTS` the row is burned |
+| `created_at` | DateTime(tz) | no | Python UTC now + `now()` | Also drives the 60 s resend cooldown |
+| `consumed_at` | DateTime(tz) | yes | `NULL` | Set on success, expiry, or burn |
+
+- Only rows with `consumed_at IS NULL` can verify. Issuing a new code consumes every
+  earlier unconsumed row for that account, so at most one code is ever live.
+- The digest is keyed with `SECRET_KEY`-derived material, not a bare SHA-256: six digits is
+  a million candidates, which an unkeyed hash would not protect.
+- Rows are kept after use rather than deleted — the cooldown and attempt limit need the
+  history.
+
+### 3.11 `mfa_recovery_codes`
+
+| Column | Type | Null | Default | Notes |
+|--------|------|------|---------|-------|
+| `id` | Integer | no | autoincrement | PK, indexed |
+| `user_id` | Integer | no | — | FK → `users.id`, `ON DELETE CASCADE`, indexed |
+| `code_hash` | String(255) | no | — | bcrypt digest; plaintext never stored |
+| `used_at` | DateTime(tz) | yes | `NULL` | Single use |
+
+- Ten rows per enrolment, replaced wholesale by `/auth/mfa/recovery-codes/regenerate` and
+  deleted by `scripts/reset_mfa.py`. The plaintext codes are returned once, in the response
+  that creates them.
+- bcrypt runs at a lower cost factor here than for passwords (10 vs the context default):
+  a login checks all unused rows, so the default cost would add seconds to every attempt
+  without adding real protection. What protects these codes is 32 bits of entropy plus the
+  5-attempt lockout.
+
 ---
 
 ## 4. Migration chain
@@ -259,6 +321,7 @@ Alembic config: `backend/alembic.ini` (`script_location = migrations`). Run from
 | 5 | `d5e8b3f1c7a4` | `b4d8f1a6c2e9` | Add `shelf_reports.low_confidence`; backfill `urgency='unknown'` rows |
 | 6 | `b8f1c4d7e2a6` | `d5e8b3f1c7a4` | Add `alerts.sent_to_email`, `alerts.email_recipients` |
 | 7 | `a7c1e9f4d2b8` | `b8f1c4d7e2a6` | Add `email_settings` (verified transport survives redeploys) |
+| 8 | `c9f4a2d6e8b1` | `a7c1e9f4d2b8` | Add MFA + verification columns to `users`; add `email_verification_codes`, `mfa_recovery_codes`; grandfather existing users as verified |
 
 Notes:
 
@@ -279,6 +342,26 @@ alembic downgrade -1
 
 The Compose entrypoint runs `alembic upgrade head` on every container start, after
 confirming PostgreSQL accepts a real connection.
+
+Hosted deployments do not rely on that script. The app applies the chain itself from its
+lifespan hook (`app/services/schema.py`) before serving traffic, because a managed host
+starts the process with its own command and may never run the image ENTRYPOINT. The
+failure that motivated it was silent: `SELECT 1` (and therefore `GET /health`) succeeded
+against an empty database while every signup and login returned `500` — `relation "users"
+does not exist`. The upgrade is a no-op at head, and a refused upgrade is logged with its
+traceback without stopping the API, so `GET /health` can still report `services.schema`.
+
+`AUTO_MIGRATE` (default `true`) controls that step and is deliberately independent of
+`ENVIRONMENT`: an earlier version only migrated in `production`/`staging`, so a service
+created outside `render.yaml` ran with the development default, never migrated, and every
+login answered `500`. Set `AUTO_MIGRATE=false` where another process owns the schema
+(`docker compose exec backend alembic upgrade head`, CI).
+
+A database built by `Base.metadata.create_all` (what `scripts/seed.py` does) has the
+tables but no `alembic_version` row, so it reports `not_initialised` and `alembic upgrade
+head` will refuse to recreate existing tables. Create seeded data only in databases that
+were migrated first, and set `AUTO_MIGRATE=false` for such a local database so startup
+does not retry (and log a failure) on every restart.
 
 ---
 

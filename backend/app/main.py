@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.api.v1.api import api_router
-from app.services import email_settings
+from app.services import demo_account, email_settings, schema
 
 # Tag descriptions surface as section intros in the Swagger UI at /docs.
 openapi_tags = [
@@ -47,14 +47,55 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Apply email credentials verified through the Email setup screen.
+    """Bring the schema up to date, then apply email credentials saved in the UI.
 
-    They live in the database because a deployed container's filesystem is read-only
-    or ephemeral; without this hook the saved row would exist but alerts would still
-    route through whatever the environment variables said. A database failure must not
-    stop the API from booting (the container starts before the first migration on some
-    hosts), so it only downgrades alerting to env-var configuration.
+    The migration step does not duplicate the container ENTRYPOINT's
+    `alembic upgrade head` out of caution: a managed host starts the process itself
+    (Render applies its own Docker Command), and skipping the entrypoint fails
+    *silently* — `/health` answers 200 because `SELECT 1` needs no tables, while every
+    signup and login returns 500 because `users` does not exist. Upgrading here makes
+    the schema a precondition of serving traffic on any host. It runs whenever
+    `AUTO_MIGRATE` is on (the default) and is a no-op once the database is at head.
+    It is not gated on `ENVIRONMENT`: a service created outside render.yaml has no
+    `ENVIRONMENT=production`, and skipping the upgrade there is what left every
+    deployed login answering 500. The test suite turns it off because each test
+    builds its own throwaway schema.
+
+    A refused migration is logged with its traceback and the process keeps running, so
+    the deployment stays inspectable: `/health` then reports the precise schema state
+    instead of the API crashing on a database it cannot fix.
+
+    Email credentials live in the database because a deployed container's filesystem is
+    read-only or ephemeral; without this hook the saved row would exist but alerts would
+    still route through whatever the environment variables said. A database failure must
+    not stop the API from booting, so it only downgrades alerting to env-var
+    configuration.
     """
+    if settings.AUTO_MIGRATE:
+        try:
+            schema.upgrade_to_head()
+        except Exception:
+            # Deliberately not fatal. A refused migration (a database built by
+            # `create_all`, a role without DDL rights) would otherwise leave the host in
+            # a restart loop with no API to inspect; this way the service stays up, the
+            # traceback is in the deploy log, and /health reports the exact schema state
+            # next to the database it belongs to.
+            logger.exception(
+                "Database migrations could not be applied; the API is starting against "
+                "an out-of-date schema. Signup and login will fail until this is fixed — "
+                "GET /api/v1/health reports the schema state."
+            )
+
+    if settings.seed_demo_account:
+        try:
+            with SessionLocal() as db:
+                demo_account.ensure_demo_account(db)
+        except Exception:
+            logger.warning(
+                "Could not create the demo account; real accounts are unaffected.",
+                exc_info=True,
+            )
+
     try:
         with SessionLocal() as db:
             email_settings.load_into_settings(db)

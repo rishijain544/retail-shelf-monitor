@@ -57,6 +57,12 @@ export interface ServiceStatus {
   api: string;
   /** "healthy", or "unhealthy: <reason>". */
   database: string;
+  /**
+   * Alembic schema state: "head" when the migration chain is applied, otherwise
+   * "outdated: <rev> (head <rev>)" or "not_initialised: <reason>". A reachable
+   * database with an unapplied schema still fails every signup and login.
+   */
+  schema?: string;
   /** "healthy" when a Slack webhook is set, else "not_configured". */
   alert_slack?: string;
   /** "healthy" when an email transport (API key or SMTP) is set, else "not_configured". */
@@ -169,24 +175,105 @@ export interface Alert {
 }
 
 /**
- * The authenticated user's own record, as returned by POST /auth/signup,
- * POST /auth/login, and GET /auth/me.
+ * The authenticated user's own record, as returned by GET /auth/me and by the
+ * endpoints that finish a sign-in.
+ *
+ * The two flags are optional because they were added with MFA: an older cached
+ * payload (or a test double) may not carry them. Treat `undefined` as "unknown",
+ * never as false, when deciding what to tell the user.
  */
 export interface User {
   id: number;
   email: string;
   store_id: number;
+  email_verified?: boolean;
+  mfa_enabled?: boolean;
 }
 
 /**
- * Response shared by POST /auth/signup and POST /auth/login: a bearer token
- * plus the user it belongs to.
+ * A full session: the only token this app ever persists.
+ *
+ * Returned by the demo login (and any `mfa_exempt` account), by POST
+ * /auth/mfa/verify after the second factor, and by POST /auth/mfa/setup/confirm
+ * once enrolment is complete.
  */
 export interface AuthTokenResponse {
   access_token: string;
   token_type: string;
   expires_in: number;
   user: User;
+}
+
+/**
+ * 202 from POST /auth/signup. Deliberately has no token: the address is not a
+ * usable login until the emailed code is confirmed.
+ */
+export interface SignupPendingResponse {
+  status: 'verification_required';
+  email: string;
+  expires_in: number;
+}
+
+/** 200 from POST /auth/verify-email — a token that only opens the enrolment routes. */
+export interface VerifyEmailResponse {
+  status: 'email_verified';
+  setup_token: string;
+  expires_in: number;
+}
+
+/** Password accepted, but the account has an authenticator enrolled. */
+export interface MfaChallengeResponse {
+  status: 'mfa_required';
+  challenge_token: string;
+  expires_in: number;
+}
+
+/** Password accepted, but no authenticator is enrolled yet (mandatory). */
+export interface MfaSetupRequiredResponse {
+  status: 'mfa_setup_required';
+  setup_token: string;
+  expires_in: number;
+}
+
+/**
+ * POST /auth/login answers with one of three shapes. Only the first is a session;
+ * the other two carry a short-lived token that belongs in memory, never in
+ * localStorage (it is not a login and must not survive a reload).
+ */
+export type LoginResponse =
+  | AuthTokenResponse
+  | MfaChallengeResponse
+  | MfaSetupRequiredResponse;
+
+/** True when the password step succeeded and a second factor is required. */
+export function isMfaChallenge(body: LoginResponse): body is MfaChallengeResponse {
+  return (body as MfaChallengeResponse).status === 'mfa_required';
+}
+
+/** True when the password step succeeded but no authenticator is enrolled yet. */
+export function isMfaSetupRequired(
+  body: LoginResponse,
+): body is MfaSetupRequiredResponse {
+  return (body as MfaSetupRequiredResponse).status === 'mfa_setup_required';
+}
+
+/** 200 from POST /auth/mfa/setup/start — shown once, then never retrievable. */
+export interface MfaSetupStartResponse {
+  secret: string;
+  otpauth_uri: string;
+  issuer: string;
+  account: string;
+}
+
+/** Enrolment finished: a session plus the one-time recovery codes. */
+export interface MfaSetupConfirmResponse extends AuthTokenResponse {
+  recovery_codes: string[];
+}
+
+/** Generic `{ status, message }` receipt used by the resend endpoint. */
+export interface AuthStatusResponse {
+  status: string;
+  message?: string | null;
 }
 
 /** 202 receipt from POST /captures/upload — this is NOT the analysis result. */
@@ -261,12 +348,19 @@ export interface TestAlertResult {
 export class ApiError extends Error {
   readonly status: number;
   readonly detail: string | null;
+  /**
+   * Machine-readable reason for auth failures, e.g. `"email_unverified"`,
+   * `"account_locked"`, `"mfa_locked"`, `"mfa_challenge_invalid"`. Branch on this
+   * rather than on the wording of `detail`, which is meant for humans.
+   */
+  readonly code: string | null;
 
-  constructor(status: number, detail: string | null, url: string) {
+  constructor(status: number, detail: string | null, url: string, code: string | null = null) {
     super(detail ?? `Request to ${url} failed with status ${status}`);
     this.name = 'ApiError';
     this.status = status;
     this.detail = detail;
+    this.code = code;
   }
 }
 
@@ -282,16 +376,25 @@ function buildQuery(params: Record<string, QueryValue>): string {
   return qs ? `?${qs}` : '';
 }
 
-/** Pull FastAPI's {"detail": ...} out of an error body, tolerating non-JSON. */
-async function readErrorDetail(response: Response): Promise<string | null> {
+/**
+ * Pull FastAPI's `{ "detail": …, "code": … }` out of an error body.
+ *
+ * `detail` is always shown to a person; `code` is what the auth screens branch on
+ * (lockout vs. wrong code vs. expired challenge), so both are kept.
+ */
+async function readErrorBody(
+  response: Response,
+): Promise<{ detail: string | null; code: string | null }> {
   try {
-    const body = await response.json();
-    const detail = (body as { detail?: unknown })?.detail;
-    if (typeof detail === 'string') return detail;
-    if (detail !== undefined) return JSON.stringify(detail);
-    return null;
+    const body = (await response.json()) as { detail?: unknown; code?: unknown };
+    const detail = body?.detail;
+    return {
+      detail:
+        typeof detail === 'string' ? detail : detail !== undefined ? JSON.stringify(detail) : null,
+      code: typeof body?.code === 'string' ? body.code : null,
+    };
   } catch {
-    return null;
+    return { detail: null, code: null };
   }
 }
 
@@ -299,14 +402,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const url = `${API_BASE_URL}${path}`;
   const mergedInit: RequestInit = {
     ...init,
+    // Caller headers win: the MFA flow passes its short-lived setup/challenge
+    // token explicitly, and it must not be replaced by a stale persisted one.
     headers: {
-      ...(init?.headers ?? {}),
       ...(activeAuthHeaders() ?? {}),
+      ...(init?.headers ?? {}),
     },
   };
   const response = await fetch(url, mergedInit);
   if (!response.ok) {
-    throw new ApiError(response.status, await readErrorDetail(response), url);
+    const { detail, code } = await readErrorBody(response);
+    throw new ApiError(response.status, detail, url, code);
   }
   return (await response.json()) as T;
 }
@@ -586,16 +692,17 @@ export function saveSmtpConfig(
  * ------------------------------------------------------------------ */
 
 /**
- * POST /auth/signup — create a Store and its owner account, return a JWT.
+ * POST /auth/signup — create a Store and its owner account.
  *
  * Body: { store_name, store_location?, email, password }.
- * Returns AuthTokenResponse with `access_token` + the new `user`.
+ * Returns **202 without a token**: the account exists, a verification code has
+ * been emailed, and the address is not a login until that code is confirmed.
  */
 export function signup(
   data: { store_name: string; store_location?: string | null; email: string; password: string },
   signal?: AbortSignal,
-): Promise<AuthTokenResponse> {
-  return request<AuthTokenResponse>('/auth/signup', {
+): Promise<SignupPendingResponse> {
+  return request<SignupPendingResponse>('/auth/signup', {
     method: 'POST',
     body: JSON.stringify(data),
     headers: { 'Content-Type': 'application/json' },
@@ -604,21 +711,131 @@ export function signup(
 }
 
 /**
- * POST /auth/login — authenticate with email+password, return a JWT.
+ * POST /auth/login — the password step.
  *
- * Body: { email, password }. Returns AuthTokenResponse with `access_token` +
- * the authenticated `user`.
+ * Answers with a full session only for an `mfa_exempt` account (the demo login).
+ * Everything else gets `mfa_required` (second factor) or `mfa_setup_required`
+ * (enrol first), and those tokens are held in memory by useMfaSession.
  */
 export function login(
   data: { email: string; password: string },
   signal?: AbortSignal,
-): Promise<AuthTokenResponse> {
-  return request<AuthTokenResponse>('/auth/login', {
+): Promise<LoginResponse> {
+  return request<LoginResponse>('/auth/login', {
     method: 'POST',
     body: JSON.stringify(data),
     headers: { 'Content-Type': 'application/json' },
     signal,
   });
+}
+
+/** POST /auth/verify-email — consume the emailed 6-digit code. */
+export function verifyEmail(
+  data: { email: string; code: string },
+  signal?: AbortSignal,
+): Promise<VerifyEmailResponse> {
+  return request<VerifyEmailResponse>('/auth/verify-email', {
+    method: 'POST',
+    body: JSON.stringify(data),
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+  });
+}
+
+/**
+ * POST /auth/resend-verification — a fresh code.
+ *
+ * The server enforces a 60-second cooldown and answers 429 with
+ * `code: "resend_cooldown"` inside it; the verify screen mirrors that countdown
+ * so the button is not offered while it would be refused.
+ */
+export function resendVerification(
+  data: { email: string },
+  signal?: AbortSignal,
+): Promise<AuthStatusResponse> {
+  return request<AuthStatusResponse>('/auth/resend-verification', {
+    method: 'POST',
+    body: JSON.stringify(data),
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+  });
+}
+
+/**
+ * POST /auth/mfa/verify — exchange a challenge token plus a TOTP (or recovery)
+ * code for a real access token.
+ *
+ * The challenge token travels in the body, as the API defines it.
+ */
+export function mfaVerify(
+  data: { challenge_token: string; code: string },
+  signal?: AbortSignal,
+): Promise<AuthTokenResponse> {
+  return request<AuthTokenResponse>('/auth/mfa/verify', {
+    method: 'POST',
+    body: JSON.stringify(data),
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+  });
+}
+
+/**
+ * POST /auth/mfa/setup/start — issue a pending authenticator secret.
+ *
+ * Authenticated by the in-memory `mfa_setup` token, not by a session.
+ */
+export function mfaSetupStart(
+  setupToken: string,
+  signal?: AbortSignal,
+): Promise<MfaSetupStartResponse> {
+  return request<MfaSetupStartResponse>('/auth/mfa/setup/start', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${setupToken}` },
+    signal,
+  });
+}
+
+/**
+ * POST /auth/mfa/setup/confirm — enable MFA and return the recovery codes.
+ *
+ * This is the only response that ever contains the plaintext codes; they cannot be
+ * retrieved again, which is why the UI insists they are saved before continuing.
+ */
+export function mfaSetupConfirm(
+  setupToken: string,
+  data: { code: string },
+  signal?: AbortSignal,
+): Promise<MfaSetupConfirmResponse> {
+  return request<MfaSetupConfirmResponse>('/auth/mfa/setup/confirm', {
+    method: 'POST',
+    body: JSON.stringify(data),
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${setupToken}`,
+    },
+    signal,
+  });
+}
+
+/**
+ * POST /auth/mfa/recovery-codes/regenerate — replace all recovery codes.
+ *
+ * Requires the session **and** both factors (password + current TOTP code), so a
+ * stolen session alone cannot mint itself a permanent way in.
+ */
+export function regenerateRecoveryCodes(
+  data: { password: string; code: string },
+  signal?: AbortSignal,
+): Promise<{ status: string; recovery_codes: string[] }> {
+  return request<{ status: string; recovery_codes: string[] }>(
+    '/auth/mfa/recovery-codes/regenerate',
+    {
+      method: 'POST',
+      body: JSON.stringify(data),
+      headers: { 'Content-Type': 'application/json' },
+      signal,
+    },
+  );
 }
 
 /**

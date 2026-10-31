@@ -47,6 +47,15 @@ services:
       # working when they are unset (the app treats both as optional).
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      # Auth secrets, same by-reference treatment. In development an empty
+      # MFA_ENCRYPTION_KEY falls back to a key derived from SECRET_KEY with a warning;
+      # set it before enrolling real accounts so TOTP secrets survive a SECRET_KEY
+      # rotation (generate: python -c "from cryptography.fernet import Fernet;
+      # print(Fernet.generate_key().decode())").
+      - SECRET_KEY=${SECRET_KEY:-}
+      - MFA_ENCRYPTION_KEY=${MFA_ENCRYPTION_KEY:-}
+      - MFA_ISSUER_NAME=${MFA_ISSUER_NAME:-ShelfMonitor}
+      - DEV_LOG_VERIFICATION_CODES=${DEV_LOG_VERIFICATION_CODES:-false}
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     volumes:

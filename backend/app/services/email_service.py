@@ -410,6 +410,53 @@ def notify_high_urgency(
     )
 
 
+def send_verification_code(
+    to_email: str,
+    code: str,
+    *,
+    store_name: str | None = None,
+) -> list[str]:
+    """Mail a signup verification code. Returns the addresses it reached.
+
+    Same transports as alerts, and the same rule: never raise. A signup must still
+    succeed when mail is misconfigured — the caller reports "could not send" and the
+    user can request a new code once the relay is fixed.
+
+    The code is only ever placed in this message body. It is never logged here and
+    never returned by an API response.
+    """
+    where = f" for {store_name}" if store_name else ""
+    subject = "[ShelfMonitor] Your sign-up verification code"
+    text_body = (
+        f"Welcome to ShelfMonitor{where}.\n"
+        f"\n"
+        f"Your verification code is: {code}\n"
+        f"\n"
+        f"It expires in a few minutes and can be used once. If you did not create "
+        f"this account, ignore this message — the address will not be activated.\n"
+        f"\n"
+        f"— ShelfMonitor (Restocking & Shelf Management Assistant)\n"
+    )
+    html_body = f"""\
+<html>
+  <body style="font-family: system-ui, -apple-system, Segoe UI, Arial, sans-serif; color: #111827;">
+    <h2 style="margin:0 0 4px;">Verify your email</h2>
+    <p style="margin:0 0 16px;color:#4b5563;">Welcome to ShelfMonitor{where}.</p>
+    <p style="margin:0 0 8px;">Your verification code is:</p>
+    <p style="font-size:28px;font-weight:700;letter-spacing:6px;margin:0 0 16px;">{code}</p>
+    <p style="margin:0 0 12px;color:#4b5563;">
+      It expires in a few minutes and can be used once.
+    </p>
+    <p style="margin:0;color:#6b7280;font-size:12px;">
+      — ShelfMonitor (Restocking &amp; Shelf Management Assistant). If you did not
+      create this account, ignore this message.
+    </p>
+  </body>
+</html>
+"""
+    return _send(to_emails=[to_email], subject=subject, text_body=text_body, html_body=html_body)
+
+
 def send_test_message(
     to_emails: Sequence[str | None],
     *,

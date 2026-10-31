@@ -2,10 +2,11 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ShieldCheck, Loader2, AlertCircle, Sparkles } from 'lucide-react';
 
-import { login, type AuthTokenResponse } from '../api/client';
-import { describeError } from '../api/errors';
+import { ApiError, isMfaChallenge, isMfaSetupRequired, login } from '../api/client';
+import { describeAuthError } from '../api/errors';
 import { DEMO_EMAIL, DEMO_PASSWORD } from '../demo';
 import { useAuth } from '../hooks/useAuth';
+import { beginMfaChallenge, beginMfaSetup } from '../hooks/useMfaSession';
 
 /** Which control started the in-flight sign-in, so only it shows a spinner. */
 type PendingSource = 'form' | 'demo' | null;
@@ -20,7 +21,14 @@ export default function LoginPage() {
 
   const loading = pending !== null;
 
-  /** Shared by the form submit and the one-click demo sign-in. */
+  /**
+   * Shared by the form submit and the one-click demo sign-in.
+   *
+   * A correct password is no longer a session: the response says whether a second
+   * factor is needed or an authenticator must be enrolled first. Both of those
+   * carry a short-lived token that is kept in memory (useMfaSession) — it is never
+   * written to localStorage, so a refresh restarts here.
+   */
   const signIn = async (
     credentials: { email: string; password: string },
     source: Exclude<PendingSource, null>,
@@ -28,11 +36,35 @@ export default function LoginPage() {
     setPending(source);
     setError(null);
     try {
-      const body: AuthTokenResponse = await login(credentials);
+      const body = await login(credentials);
+
+      if (isMfaChallenge(body)) {
+        beginMfaChallenge(credentials.email, body.challenge_token, body.expires_in);
+        navigate('/login/mfa', { replace: true });
+        return;
+      }
+
+      if (isMfaSetupRequired(body)) {
+        beginMfaSetup(credentials.email, body.setup_token, body.expires_in);
+        navigate('/login/mfa-setup', { replace: true });
+        return;
+      }
+
+      // An mfa_exempt account (the shared demo login) or a completed sign-in.
       setAuth(body.user, body.access_token);
       navigate('/', { replace: true });
     } catch (err) {
-      setError(describeError(err));
+      // A 401 on the demo path does not mean the visitor typed something wrong — the
+      // button supplied the credentials. It means this deployment has no demo account
+      // (SEED_DEMO_ACCOUNT is off, or the database was never seeded), so point at the
+      // route that definitely works instead of echoing "Incorrect email or password."
+      if (source === 'demo' && err instanceof ApiError && err.status === 401) {
+        setError(
+          'This deployment has no demo account yet. Create your own with “Create one” below — it takes a few seconds.',
+        );
+      } else {
+        setError(describeAuthError(err));
+      }
     } finally {
       setPending(null);
     }
@@ -87,7 +119,7 @@ export default function LoginPage() {
 
           <h1 className="text-2xl font-bold text-gray-900 mb-2">Sign in</h1>
           <p className="text-sm text-gray-500 mb-8">
-            Enter your account email and password.
+            Enter your account email and password, then confirm with your authenticator app.
           </p>
 
           <form onSubmit={handleSubmit} className="space-y-5">

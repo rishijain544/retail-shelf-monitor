@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.services import email_service
+from app.services import email_service, schema
 
 router = APIRouter()
 
@@ -48,6 +48,10 @@ def health_check(db: Session = Depends(get_db)):
         "services": {
             "api": "healthy",
             "database": "unknown",
+            # Schema state, reported separately because a reachable database is not a
+            # usable one: without the tables `SELECT 1` still succeeds while every
+            # signup/login answers 500. "head" is the only good value.
+            "schema": "unknown",
             # Alert delivery channels. "not_configured" is not a failure — it means no
             # credentials were supplied, which is the reason an alert can be raised and
             # yet no message leaves the building. Reporting it here makes that visible
@@ -62,6 +66,7 @@ def health_check(db: Session = Depends(get_db)):
     try:
         db.execute(text("SELECT 1"))
         health_status["services"]["database"] = "healthy"
+        health_status["services"]["schema"] = schema.schema_status(db)
     except Exception as e:
         health_status["status"] = "unhealthy"
         health_status["services"]["database"] = f"unhealthy: {str(e)}"

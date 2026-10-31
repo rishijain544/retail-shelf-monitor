@@ -19,7 +19,7 @@ import app.models  # noqa: F401  (register every table on Base.metadata)
 from app.core.auth_deps import get_current_user
 from app.core.config import settings
 from app.core.database import Base, get_db
-from app.core.security import create_access_token
+from app.core.security import create_access_token, hash_password
 from app.main import app
 from app.models.store import Store
 from app.models.user import User
@@ -62,29 +62,29 @@ def client(engine):
 
 @pytest.fixture
 def user_with_store(client, engine):
-    """Create a user who owns a store, return (user, store, token)."""
-    # Sign up via the auth endpoint to create store + user together
-    resp = client.post(
-        f"{BASE}/auth/signup",
-        json={
-            "store_name": "Test Store",
-            "store_location": "Test City",
-            "email": "user@test.com",
-            "password": "correct-horse",
-        },
-    )
-    assert resp.status_code == 201, resp.text
-    data = resp.json()
-    token = data["access_token"]
-    user_id = int(data["user"]["id"])
-    store_id = data["user"]["store_id"]
+    """Create a user who owns a store, return (user, store, token).
 
-    # Fetch the user and store from the same in-memory db the app uses.
+    Rows are inserted directly rather than through POST /auth/signup: signup now
+    deliberately returns no token (the address must be verified first), and these
+    tests are about tenant scoping, not about the sign-in flow.
+    """
     TestingSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     db = TestingSessionLocal()
     try:
-        user = db.get(User, user_id)
-        store = db.get(Store, store_id)
+        store = Store(name="Test Store", location="Test City")
+        db.add(store)
+        db.flush()
+        user = User(
+            email="user@test.com",
+            hashed_password=hash_password("correct-horse"),
+            store_id=store.id,
+            email_verified=True,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        db.refresh(store)
+        token = create_access_token(user.id)
     finally:
         db.close()
 
