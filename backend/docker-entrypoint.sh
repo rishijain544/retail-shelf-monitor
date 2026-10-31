@@ -68,6 +68,9 @@ mkdir -p "$UPLOAD_DIR"
 echo "[entrypoint] alembic upgrade head"
 cd /app
 alembic upgrade head
-
+if [ "${SEED_DEMO_ACCOUNT:-false}" = "true" ]; then
+  echo "[entrypoint] seeding demo account..."
+  python /app/scripts/seed.py
+fi
 echo "[entrypoint] starting: $*"
 exec "$@"

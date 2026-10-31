@@ -17,28 +17,20 @@ services:
     # The ML inference needs real memory: torch + OpenCV + a loaded YOLOv8 model do
     # not fit comfortably in the 512 MB Starter instance. Switch to `starter` only if
     # you accept occasional OOM restarts during analysis.
-    plan: standard
+    plan: free
     region: oregon
     dockerfilePath: ./backend/Dockerfile
     # Repo root, not backend/: the image also needs ml/ (see backend/Dockerfile).
     dockerContext: .
-    # Override the development CMD (which uses --reload). Render does not guarantee
-    # shell expansion for dockerCommand, so ask for a shell explicitly; that is what
-    # turns $PORT into the port Render assigned.
-    # NOTE: this value replaces the image CMD, and managed hosts do not promise that
-    # the image ENTRYPOINT (which waits for Postgres and runs `alembic upgrade head`)
-    # runs at all. The app therefore applies the migration chain itself in its lifespan
-    # hook (AUTO_MIGRATE, on by default and independent of ENVIRONMENT) — see
-    # backend/app/services/schema.py.
+    # Override the development CMD (which uses --reload). The image's ENTRYPOINT still
+    # runs first (wait for Postgres -> alembic upgrade head) and then execs this.
+    # Render does not guarantee shell expansion for dockerCommand, so ask for a shell
+    # explicitly; that is what turns $PORT into the port Render assigned.
     dockerCommand: /bin/sh -c 'exec uvicorn app.main:app --host 0.0.0.0 --port "$PORT"'
     healthCheckPath: /api/v1/health
     autoDeploy: true
     # Uploaded shelf photos must survive redeploys; the container filesystem does not.
     # Requires a paid instance type (Render disks are not available on Free).
-    disk:
-      name: shelf-uploads
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       # "production" enforces SECRET_KEY and turns on the CORS warning.
       # A service created from the Render dashboard instead of this blueprint gets
@@ -67,7 +59,8 @@ services:
         value: https://.*\.vercel\.app
       # Persistent disk mount for capture images, served at /uploads.
       - key: UPLOAD_DIR
-        value: /var/data/uploads
+        value: /tmp/uploads
+
       - key: ALERT_EMAIL_ENABLED
         value: "true"
       # Creates the demo account advertised on the sign-in page when the database has
