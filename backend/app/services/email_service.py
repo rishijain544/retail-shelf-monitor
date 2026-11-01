@@ -21,6 +21,7 @@ must never fail the capture pipeline.
 
 from __future__ import annotations
 
+import html
 import logging
 import re
 import smtplib
@@ -474,3 +475,97 @@ def send_test_message(
         f"— ShelfMonitor (Restocking & Shelf Management Assistant)\n"
     )
     return _send(to_emails=to_emails, subject=subject, text_body=text_body)
+
+
+def send_password_reset(
+    to_email: str,
+    reset_link: str,
+    *,
+    expires_minutes: int,
+) -> list[str]:
+    """Mail a password-reset link. Returns the addresses it reached.
+
+    The link is built by the caller from ``settings.FRONTEND_BASE_URL`` — never from
+    request headers — so this function only has to defend the markup: every dynamic
+    value is HTML-escaped before it lands in the HTML part.
+    """
+    subject = "Reset your ShelfMonitor password"
+    safe_link = html.escape(reset_link, quote=True)
+    text_body = (
+        f"Someone asked to reset the ShelfMonitor password for this address.\n"
+        f"\n"
+        f"Open this link to choose a new password:\n"
+        f"{reset_link}\n"
+        f"\n"
+        f"The link expires in {expires_minutes} minutes and can be used once.\n"
+        f"\n"
+        f"If you didn't request this, ignore this email — your password stays as it is.\n"
+        f"\n"
+        f"— ShelfMonitor (Restocking & Shelf Management Assistant)\n"
+    )
+    html_body = f"""\
+<html>
+  <body style="font-family: system-ui, -apple-system, Segoe UI, Arial, sans-serif; color: #111827;">
+    <h2 style="margin:0 0 4px;">Reset your password</h2>
+    <p style="margin:0 0 16px;color:#4b5563;">
+      Someone asked to reset the ShelfMonitor password for this address.
+    </p>
+    <p style="margin:0 0 20px;">
+      <a href="{safe_link}"
+         style="display:inline-block;background:#111827;color:#ffffff;padding:12px 20px;border-radius:6px;text-decoration:none;font-weight:600;">
+        Choose a new password
+      </a>
+    </p>
+    <p style="margin:0 0 12px;color:#4b5563;">
+      The link expires in {expires_minutes} minutes and can be used once.
+    </p>
+    <p style="margin:0 0 12px;color:#4b5563;">
+      If you didn't request this, ignore this email — your password stays as it is.
+    </p>
+    <p style="margin:0;color:#6b7280;font-size:12px;">
+      — ShelfMonitor (Restocking &amp; Shelf Management Assistant)
+    </p>
+  </body>
+</html>
+"""
+    return _send(
+        to_emails=[to_email], subject=subject, text_body=text_body, html_body=html_body
+    )
+
+
+def send_password_changed_notice(to_email: str) -> list[str]:
+    """Tell an account its password was just changed, after a successful reset.
+
+    This is the only warning a user gets if someone else reset their password, so the
+    support path is spelled out. Same rule as every other send here: never raise.
+    """
+    subject = "Your ShelfMonitor password was changed"
+    text_body = (
+        f"The ShelfMonitor password for this address was just changed.\n"
+        f"\n"
+        f"All other signed-in sessions have been signed out.\n"
+        f"\n"
+        f"If this wasn't you, contact support immediately and reset your password "
+        f"again from the sign-in page.\n"
+        f"\n"
+        f"— ShelfMonitor (Restocking & Shelf Management Assistant)\n"
+    )
+    html_body = """\
+<html>
+  <body style="font-family: system-ui, -apple-system, Segoe UI, Arial, sans-serif; color: #111827;">
+    <h2 style="margin:0 0 4px;">Your password was changed</h2>
+    <p style="margin:0 0 12px;color:#4b5563;">
+      The ShelfMonitor password for this address was just changed. All other
+      signed-in sessions have been signed out.
+    </p>
+    <p style="margin:0 0 12px;color:#b91c1c;">
+      If this wasn't you, contact support immediately and reset your password again
+      from the sign-in page.
+    </p>
+    <p style="margin:0;color:#6b7280;font-size:12px;">
+      — ShelfMonitor (Restocking &amp; Shelf Management Assistant)
+    </p>
+  </body>
+</html>
+"""
+    return _send(to_emails=[to_email], subject=subject, text_body=text_body, html_body=html_body)

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { ShieldCheck, Loader2, AlertCircle, Sparkles } from 'lucide-react';
 
 import { ApiError, isMfaChallenge, isMfaSetupRequired, login } from '../api/client';
@@ -14,6 +14,13 @@ type PendingSource = 'form' | 'demo' | null;
 export default function LoginPage() {
   const navigate = useNavigate();
   const { login: setAuth } = useAuth();
+  /**
+   * A one-time notice carried from another screen — today only "Password updated."
+   * after a reset. Router state, not storage: it disappears with the history entry and
+   * is never persisted or shared across tabs.
+   */
+  const location = useLocation();
+  const notice = (location.state as { notice?: string } | null)?.notice ?? null;
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [pending, setPending] = useState<PendingSource>(null);
@@ -123,6 +130,19 @@ export default function LoginPage() {
           </p>
 
           <form onSubmit={handleSubmit} className="space-y-5">
+            {notice && (
+              <div
+                role="status"
+                className="rounded-lg bg-green-50 border border-green-200 text-green-800 text-sm px-4 py-3"
+              >
+                <p className="font-semibold">{notice}</p>
+                <p className="mt-1 text-green-700">
+                  If two-factor is enabled on your account, you&apos;ll still be asked for your
+                  authenticator code.
+                </p>
+              </div>
+            )}
+
             {error && (
               <div className="flex items-center gap-2 rounded-lg bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3">
                 <AlertCircle className="h-4 w-4 flex-shrink-0" />
@@ -149,12 +169,20 @@ export default function LoginPage() {
             </div>
 
             <div>
-              <label
-                htmlFor="login-password"
-                className="block text-sm font-semibold text-gray-700 mb-1.5"
-              >
-                Password
-              </label>
+              <div className="flex items-baseline justify-between mb-1.5">
+                <label
+                  htmlFor="login-password"
+                  className="block text-sm font-semibold text-gray-700"
+                >
+                  Password
+                </label>
+                <Link
+                  to="/forgot-password"
+                  className="text-xs font-semibold text-sky-600 hover:text-sky-700"
+                >
+                  Forgot password?
+                </Link>
+              </div>
               <input
                 id="login-password"
                 type="password"

@@ -176,6 +176,22 @@ def test_signup_short_password_rejected(client):
     assert resp.status_code == 422, resp.text
 
 
+def test_signup_multibyte_password_over_bcrypt_bytes_rejected(client):
+    """40 characters of 3-byte text is 120 bytes, which bcrypt would silently truncate.
+
+    The character check alone passes, so without a byte check the account is created
+    with a password password that is really only its first 72 bytes.
+    """
+    password = "\u3042" * 40  # 'あ' — three bytes each in UTF-8
+    assert len(password) == 40
+    assert len(password.encode("utf-8")) == 120
+
+    resp = _signup(client, password=password)
+
+    assert resp.status_code == 422, resp.text
+    assert "bytes" in resp.text
+
+
 def test_signup_invalid_email_rejected(client):
     resp = _signup(client, email="not-an-email")
     assert resp.status_code == 422, resp.text

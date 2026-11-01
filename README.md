@@ -759,6 +759,22 @@ delivery flags, email configuration, health, timestamps, and an end-to-end captu
 `tests/conftest.py` blanks every email credential for each test, so **no test can send real
 mail**; Slack is mocked at the `httpx` boundary.
 
+#### Migrations on PostgreSQL (opt-in)
+
+The suite runs on SQLite, which silently hides PostgreSQL-only mistakes: revision
+`d5e8b3f1c7a4` wrote `1` into a real boolean column, so the chain aborted on a fresh
+PostgreSQL volume while every SQLite test stayed green. To apply the whole chain to a
+throwaway database and verify the result, run it against the compose `db` service:
+
+```bash
+docker compose exec -T backend python scripts/check_migrations_postgres.py
+```
+
+It creates a uniquely named database, runs `alembic upgrade head`, checks that every
+expected table exists and `alembic_version` equals the script head, then drops the
+database — and exits non-zero on any failure. It is deliberately a separate command, not
+a test, so the default `python -m pytest` run still needs no database server.
+
 ### ML
 
 ```bash
@@ -790,9 +806,12 @@ no running backend required.
 | Tokens stop working after every restart | `SECRET_KEY` is unset, so a random per-process key is used. Set it in `backend/.env`. |
 | `SECRET_KEY must be set` at startup | `ENVIRONMENT=production`/`staging` requires a ≥32-character key. |
 | Alerts show "Not sent" | No transport configured or delivery failed. Check `/health` → `alert_email`, and the backend logs. |
+| Password reset link points at `localhost:5173` | `FRONTEND_BASE_URL` is unset, so it kept its development default. Set it to the deployed dashboard origin and restart the API. |
+| "Forgot password" answers 202 but no email arrives | Expected for an address that does not exist, is `mfa_exempt` (the demo login) or ends in `.test`. Otherwise check `/health` → `alert_email`: resets use the same transport as alerts. |
 | `POST /alerts/test` returns `503` | Neither Slack nor email is configured. `502` means configured but every channel failed. |
 | Email reaches only one address | You are on a free-tier API key. Configure SMTP, which can mail every login address. |
 | Capture stuck at "processing" | The process restarted mid-pipeline; there is no durable queue yet. Re-upload the capture. |
+| Backend crash-loops with `sqlite3.OperationalError: unable to open database file` | `backend/.env` is bind-mounted into the container, so its local `DATABASE_URL=sqlite:///…` reachable from a Windows host path was loaded there. `docker-compose.yml` now pins `DATABASE_URL` to the `db` service and sets `ENVIRONMENT=docker`, which makes the app refuse a SQLite URL at startup with an explicit message instead of that opaque error. |
 | Upload rejected as blurry/dark | The image quality gate refused it. Take a sharper, brighter shelf photo. |
 | `libGL.so.1` error with OpenCV | Install the OpenGL runtime (the Docker image already includes it). |
 | Duplicate stores after seeding | Older seed versions were not idempotent. Reset the database and reseed (see [database.md](database.md)). |

@@ -36,6 +36,11 @@ A token with any other purpose (or with no `purpose` claim at all, such as one m
 before this scheme existed) is rejected on every endpoint with `401` and
 `WWW-Authenticate: Bearer` — clients must sign in again.
 
+Every token also carries `iat`. A token with no usable `iat` is rejected, and so is any
+token issued before the account's `users.password_changed_at`; `POST /auth/reset-password`
+moves that timestamp forward, which signs the account out everywhere — access tokens and
+in-flight `mfa_challenge`/`mfa_setup` tokens alike.
+
 Missing, malformed, or expired tokens return:
 
 ```json
@@ -125,6 +130,8 @@ List endpoints return a generic envelope (not a bare array):
 | POST | `/auth/signup` | — | Create store + owner, email a verification code (no token) |
 | POST | `/auth/verify-email` | — | Confirm the address, return an `mfa_setup` token |
 | POST | `/auth/resend-verification` | — | New verification code (60 s cooldown) |
+| POST | `/auth/forgot-password` | — | Email a reset link (identical 202 for any address) |
+| POST | `/auth/reset-password` | — | Set a new password from a reset link (no session) |
 | POST | `/auth/login` | — | Password step: session, MFA challenge, or enrolment |
 | POST | `/auth/mfa/verify` | challenge | TOTP or recovery code → `access` token |
 | POST | `/auth/mfa/setup/start` | setup | Issue an authenticator secret |
@@ -215,7 +222,7 @@ a working login.
 | `store_name` | 1–255 chars |
 | `store_location` | optional, ≤255 chars |
 | `email` | trimmed + lower-cased; must look like `local@domain.tld`; ≤320 chars |
-| `password` | 8–72 chars |
+| `password` | 8–72 chars, and at most 72 bytes in UTF-8 (bcrypt's limit) |
 
 **Response `202`**
 
@@ -260,6 +267,52 @@ unknown address return the same `400`.
 **Response `202`** — `{ "status": "verification_sent" }` (also for an unknown address, so
 the endpoint is not an account oracle), or `{ "status": "already_verified" }`. A second
 request inside 60 seconds returns `429` with `code: "resend_cooldown"`.
+
+### `POST /auth/forgot-password`
+
+```json
+{ "email": "owner@example.com" }
+```
+
+**Response `202`** — always, for every address:
+
+```json
+{ "status": "reset_requested", "message": "If that address has an account, a reset link is on its way." }
+```
+
+The lookup and the mail are a background task, so an unknown address is not faster than a
+known one. A link is only created and mailed when the account exists, is not `mfa_exempt`,
+and its address does not end in `.test` (so the demo login can never be reset). One email
+per `PASSWORD_RESET_COOLDOWN_SECONDS` (default 60) per account; a per-IP budget of 10/hour
+is also applied. Both limits still answer the same `202` and are only logged.
+
+The link is `{FRONTEND_BASE_URL}/reset-password?token=…` and expires after
+`PASSWORD_RESET_TTL_MINUTES` (default 30). Only the token's SHA-256 digest is stored, and
+a new request invalidates every earlier unused link for that account.
+
+### `POST /auth/reset-password`
+
+```json
+{ "token": "<token from the emailed link>", "new_password": "at-least-8-chars" }
+```
+
+**Response `200`** — a status only; there is no token of any kind in it:
+
+```json
+{ "status": "password_reset", "message": "Your password has been changed. Sign in with your new password." }
+```
+
+`new_password` uses the same rule as signup (`8`–`72` characters **and** at most 72 bytes
+in UTF-8 — 40 characters of 3-byte text is 120 bytes and is rejected), so a `422` means the
+password itself is unacceptable. On success the password is re-hashed, `email_verified`
+becomes `true`, `password_changed_at` moves forward (invalidating every existing JWT), a
+failed-login lockout is cleared, and the user is emailed a "password changed" notice. MFA
+state, its lockout and the recovery codes are untouched — signing in still requires the
+authenticator code.
+
+**Errors** — `400` `reset_token_invalid` for an unknown, expired, already-used or
+superseded link (one message for all four); `429` `password_reset_rate_limited` after 20
+attempts from one IP in an hour.
 
 ### `POST /auth/login`
 

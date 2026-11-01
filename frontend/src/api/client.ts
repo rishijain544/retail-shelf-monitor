@@ -762,6 +762,50 @@ export function resendVerification(
 }
 
 /**
+ * POST /auth/forgot-password — ask for a reset link.
+ *
+ * The server answers `202 {status: "reset_requested"}` for **every** address, known or
+ * not, and sends the lookup and the mail as a background task. The response body is
+ * therefore not evidence that an account exists, and the UI must not present it as one:
+ * show the same wording either way.
+ */
+export function forgotPassword(
+  email: string,
+  signal?: AbortSignal,
+): Promise<AuthStatusResponse> {
+  return request<AuthStatusResponse>('/auth/forgot-password', {
+    method: 'POST',
+    body: JSON.stringify({ email }),
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+  });
+}
+
+/**
+ * POST /auth/reset-password — apply the token from the emailed link.
+ *
+ * Returns a status only: the server deliberately issues no access, challenge or setup
+ * token here, because a reset proves the mailbox and not the second factor. Sign in
+ * afterwards through the ordinary flow.
+ *
+ * A link that is unknown, expired, already used or superseded all answer `400` with
+ * `code: "reset_token_invalid"`; too many attempts answer `429` with
+ * `code: "password_reset_rate_limited"`.
+ */
+export function resetPassword(
+  token: string,
+  newPassword: string,
+  signal?: AbortSignal,
+): Promise<AuthStatusResponse> {
+  return request<AuthStatusResponse>('/auth/reset-password', {
+    method: 'POST',
+    body: JSON.stringify({ token, new_password: newPassword }),
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+  });
+}
+
+/**
  * POST /auth/mfa/verify — exchange a challenge token plus a TOTP (or recovery)
  * code for a real access token.
  *

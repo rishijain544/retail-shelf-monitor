@@ -11,13 +11,16 @@ nothing but the endpoint they belong to; presenting one anywhere else is a 401.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Union
+import logging
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core.clock import as_utc
 from app.core.security import (
     PURPOSE_ACCESS,
     PURPOSE_MFA_CHALLENGE,
@@ -26,6 +29,8 @@ from app.core.security import (
 )
 from app.models.camera import Camera
 from app.models.user import User
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from app.models.store import Store
@@ -41,6 +46,39 @@ def _unauthorized(detail: str) -> HTTPException:
         detail=detail,
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+
+def _issued_at(payload: dict[str, Any]) -> Optional[datetime]:
+    """The token's ``iat`` claim as an aware UTC datetime, or None when unusable."""
+    raw = payload.get("iat")
+    if raw is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(raw), tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def token_invalidated_by_password_change(payload: dict[str, Any], user: User) -> bool:
+    """True when `payload` must not be honoured for `user` any more.
+
+    Two rules, in one place so every factor-limited token behaves the same:
+
+    * a token without a usable ``iat`` is invalid — there is no way to date it;
+    * a reset moves ``password_changed_at`` forward, and any token signed before that
+      moment is refused. That is what signs an account out everywhere after a password
+      change (access, ``mfa_challenge`` and ``mfa_setup`` tokens alike).
+
+    Reusing this in ``/auth/mfa/verify`` matters because that route decodes its
+    challenge token itself instead of going through a dependency.
+    """
+    issued = _issued_at(payload)
+    if issued is None:
+        return True
+    changed = as_utc(user.password_changed_at)
+    if changed is None:
+        return False
+    return issued < changed
 
 
 def _user_from_token(
@@ -69,6 +107,14 @@ def _user_from_token(
     if user is None:
         # Token is well-formed but the account is gone (e.g. deleted store).
         raise _unauthorized("Invalid or expired access token.")
+    if token_invalidated_by_password_change(payload, user):
+        # A missing/undatable iat, or a token signed before the last password reset.
+        logger.info(
+            "auth: rejected %s token from before a password change user_id=%s",
+            purpose,
+            user.id,
+        )
+        raise _unauthorized("Your session has expired. Sign in again.")
     return user
 
 

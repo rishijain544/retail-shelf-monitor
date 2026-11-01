@@ -47,8 +47,20 @@ def upgrade() -> None:
     # Zero-detection captures were previously recorded with urgency 'unknown' (and a
     # NULL fill that later downgrades pinned to 1.0). Flag them and restore an
     # ordinary urgency computed from the fill thresholds the rule-based report uses.
+    # Parameterised instead of a literal `low_confidence = 1`: a bare 1 is fine for
+    # SQLite's integer storage but Postgres refuses it against a real boolean
+    # (`column "low_confidence" is of type boolean but expression is of type integer`),
+    # which aborted the whole chain on a fresh PostgreSQL volume and crash-looped the
+    # backend container. A bound Python bool compiles per dialect (TRUE / 1).
+    shelf_reports = sa.table(
+        "shelf_reports",
+        sa.column("low_confidence", sa.Boolean()),
+        sa.column("urgency", sa.String()),
+    )
     op.execute(
-        "UPDATE shelf_reports SET low_confidence = 1 WHERE urgency = 'unknown'"
+        shelf_reports.update()
+        .where(shelf_reports.c.urgency == "unknown")
+        .values(low_confidence=True)
     )
     op.execute(
         "UPDATE shelf_reports SET urgency = CASE "

@@ -40,6 +40,19 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
       - POSTGRES_DB=${POSTGRES_DB:-shelf_monitoring}
       - POSTGRES_PORT=5432
+      # DATABASE_URL is assembled here deliberately. `./backend:/app` bind-mounts
+      # backend/.env into the container, and pydantic-settings reads that file itself,
+      # so a developer's `DATABASE_URL=sqlite:///d:/.../shelf_monitoring.db` reached the
+      # backend and it crash-looped with "sqlite3.OperationalError: unable to open
+      # database file" — a Windows host path that cannot exist inside the image.
+      # A real environment variable outranks the dotenv file, and building the URL from
+      # the same ${POSTGRES_*} values the db service consumes above keeps the two from
+      # drifting. (A password containing @ : / would have to be URL-encoded here.)
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-shelf_monitoring}
+      # Marks the process as running inside the image so config.py refuses a SQLite
+      # DATABASE_URL outright (see _reject_sqlite_in_container) instead of failing at
+      # the first query. Not a strict environment, so local SECRET_KEY defaults hold.
+      - ENVIRONMENT=docker
       - PROJECT_NAME=${PROJECT_NAME:-Retail Shelf Monitoring & Restocking Assistant}
       - API_V1_STR=${API_V1_STR:-/api/v1}
       # Both read from the repo-root .env. Passed by reference so the secrets
@@ -56,6 +69,12 @@ services:
       - MFA_ENCRYPTION_KEY=${MFA_ENCRYPTION_KEY:-}
       - MFA_ISSUER_NAME=${MFA_ISSUER_NAME:-ShelfMonitor}
       - DEV_LOG_VERIFICATION_CODES=${DEV_LOG_VERIFICATION_CODES:-false}
+      # Public origin used to build the password-reset link. Read from the repo-root
+      # .env so a deployment points at the address users actually visit; the API never
+      # derives it from request headers.
+      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-http://localhost:5173}
+      - PASSWORD_RESET_TTL_MINUTES=${PASSWORD_RESET_TTL_MINUTES:-30}
+      - PASSWORD_RESET_COOLDOWN_SECONDS=${PASSWORD_RESET_COOLDOWN_SECONDS:-60}
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     volumes:

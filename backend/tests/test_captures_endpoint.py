@@ -648,7 +648,7 @@ def test_low_confidence_report_is_not_a_trend_baseline(env, analyze_queue, clien
     # The endpoint's lookup skips the flagged row (no measurement to inherit).
     r2 = client.get(
         second["report_url"],
-        headers={"Authorization": f"Bearer {env["token"]}"},
+        headers={"Authorization": f"Bearer {env['token']}"},
     ).json()
     assert r2["previous_fill"] is None
     assert "No prior capture" in r2["report"]["summary"]
@@ -656,7 +656,7 @@ def test_low_confidence_report_is_not_a_trend_baseline(env, analyze_queue, clien
     # And the first report is flagged the whole way through.
     r1 = client.get(
         first["report_url"],
-        headers={"Authorization": f"Bearer {env["token"]}"},
+        headers={"Authorization": f"Bearer {env['token']}"},
     ).json()
     assert r1["low_confidence"] is True
     assert r1["fill_percentage"] == pytest.approx(1.0)

@@ -5,12 +5,14 @@ import { Loader2 } from 'lucide-react';
 import AppLayout from './components/AppLayout';
 import { useAuth } from './hooks/useAuth';
 import Dashboard from './pages/Dashboard';
+import ForgotPasswordPage from './pages/ForgotPasswordPage';
 import ShelfDetail from './pages/ShelfDetail';
 import Alerts from './pages/Alerts';
 import Admin from './pages/Admin';
 import LoginPage from './pages/LoginPage';
 import MfaCodePage from './pages/MfaCodePage';
 import MfaSetupPage from './pages/MfaSetupPage';
+import ResetPasswordPage from './pages/ResetPasswordPage';
 import Security from './pages/Security';
 import SignupPage from './pages/SignupPage';
 import VerifyEmailPage from './pages/VerifyEmailPage';
@@ -69,6 +71,14 @@ export default function App() {
        * refresh, which deliberately restarts the sign-in.
        */}
       <Route path="/login" element={<LoginPage />} />
+      {/*
+       * Public for the obvious reason: these exist for people who cannot sign in. They
+       * never consult useMfaSession, so a half-finished sign-in (challenge/setup token
+       * in memory) cannot pull them away, and sitting outside AuthGate means a stale
+       * session cannot redirect them either.
+       */}
+      <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+      <Route path="/reset-password" element={<ResetPasswordPage />} />
       <Route path="/login/mfa" element={<MfaCodePage />} />
       <Route path="/login/mfa-setup" element={<MfaSetupPage />} />
       <Route path="/signup" element={<SignupPage />} />

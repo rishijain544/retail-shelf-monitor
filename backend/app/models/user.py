@@ -58,6 +58,15 @@ class User(Base):
     failed_mfa_attempts = Column(Integer, nullable=False, default=0, server_default="0")
     mfa_locked_until = Column(DateTime(timezone=True), nullable=True)
 
+    # ─── Password ────────────────────────────────────────────────────────────
+    # When the password was last changed through a reset link. Every JWT carries an
+    # `iat`, and a token older than this is refused, so a reset signs the account out
+    # everywhere (access, mfa_challenge and mfa_setup tokens alike). NULL means the
+    # password has never been reset, so no token is stale by this rule.
+    # Truncated to whole seconds when written: `iat` is second-granular, so a finer
+    # value would reject a session created immediately after a successful reset.
+    password_changed_at = Column(DateTime(timezone=True), nullable=True)
+
     # Relationships
     store = relationship("Store", back_populates="users")
 

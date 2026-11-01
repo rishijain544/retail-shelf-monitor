@@ -10,6 +10,7 @@ from app.models.user import User
 from app.models.email_setting import EmailSetting
 from app.models.email_verification_code import EmailVerificationCode
 from app.models.mfa_recovery_code import MfaRecoveryCode
+from app.models.password_reset_token import PasswordResetToken
 
 __all__ = [
     "Base",
@@ -24,4 +25,5 @@ __all__ = [
     "EmailSetting",
     "EmailVerificationCode",
     "MfaRecoveryCode",
+    "PasswordResetToken",
 ]

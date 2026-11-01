@@ -33,12 +33,16 @@ import math
 from datetime import timedelta
 from typing import Optional, Union
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.auth_deps import get_current_user, get_mfa_setup_user
+from app.core.auth_deps import (
+    get_current_user,
+    get_mfa_setup_user,
+    token_invalidated_by_password_change,
+)
 from app.core.clock import as_utc, utcnow
 from app.core.config import settings
 from app.core.database import get_db
@@ -57,6 +61,7 @@ from app.models.store import Store
 from app.models.user import User
 from app.schemas.auth import (
     AuthTokenResponse,
+    ForgotPasswordRequest,
     LoginRequest,
     MfaChallengeResponse,
     MfaSetupConfirmRequest,
@@ -67,6 +72,8 @@ from app.schemas.auth import (
     RecoveryCodesResponse,
     RegenerateRecoveryCodesRequest,
     ResendVerificationRequest,
+    ResetPasswordRequest,
+    PasswordResetResponse,
     SignupPendingResponse,
     SignupRequest,
     StatusResponse,
@@ -74,7 +81,7 @@ from app.schemas.auth import (
     VerifyEmailRequest,
     VerifyEmailResponse,
 )
-from app.services import mfa, verification
+from app.services import mfa, password_reset, verification
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +103,14 @@ _GENERIC_CODE_ERROR = (
 _GENERIC_MFA_ERROR = (
     "That code is not valid. Use the current code from your authenticator app, "
     "or one of your recovery codes."
+)
+# One body for every /forgot-password caller, known address or not. Anything that
+# varies here (message, status, timing) is an account-existence oracle.
+_GENERIC_RESET_MESSAGE = (
+    "If that address has an account, a reset link is on its way."
+)
+_GENERIC_RESET_TOKEN_ERROR = (
+    "That reset link is invalid or has expired. Request a new one."
 )
 
 
@@ -328,6 +343,79 @@ def resend_verification(
 # ─── Login ────────────────────────────────────────────────────────────────────
 
 
+def _reset_requested_response() -> StatusResponse:
+    """The one response /forgot-password ever returns."""
+    return StatusResponse(status="reset_requested", message=_GENERIC_RESET_MESSAGE)
+
+
+@router.post(
+    "/forgot-password",
+    response_model=StatusResponse,
+    summary="Email a password reset link (same answer for every address)",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def forgot_password(
+    payload: ForgotPasswordRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> StatusResponse:
+    """Request a reset link. The answer never reveals whether the account exists.
+
+    The lookup and the send run in a background task, so the response is sent before
+    any work that depends on the address — an unknown address cannot be spotted by a
+    faster reply. Only the in-memory per-IP budget is consulted synchronously, and a
+    limited caller gets the same 202 (logged), not a 429: a different status here would
+    itself be an oracle about this client, not about the account.
+    """
+    ip = _client_ip(request)
+    if password_reset.allow("forgot", ip, limit=password_reset.FORGOT_MAX_PER_IP):
+        background_tasks.add_task(password_reset.request_reset, payload.email, ip)
+    else:
+        logger.info("auth: password reset rate limited ip=%s", ip)
+    return _reset_requested_response()
+
+
+@router.post(
+    "/reset-password",
+    response_model=PasswordResetResponse,
+    summary="Set a new password with an emailed reset link",
+)
+def reset_password(
+    payload: ResetPasswordRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> PasswordResetResponse:
+    """Apply a reset link: new password, all older sessions invalidated, no login.
+
+    A successful reset returns a status only — no access, challenge or setup token —
+    because a reset proves the mailbox, not a second factor. Signing in is a separate
+    step and still asks for the authenticator code on an enrolled account.
+    """
+    ip = _client_ip(request)
+    if not password_reset.allow("reset", ip, limit=password_reset.RESET_MAX_PER_IP):
+        logger.info("auth: password reset apply rate limited ip=%s", ip)
+        return _error(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Too many reset attempts. Try again later.",
+            "password_reset_rate_limited",
+            headers={"Retry-After": str(password_reset.IP_WINDOW_SECONDS)},
+        )
+
+    result, _user_id = password_reset.reset_with_token(
+        db, payload.token, payload.new_password, ip
+    )
+    if result != password_reset.RESULT_OK:
+        # reset_with_token already logged the reason with the user id (when known) and
+        # the IP; the caller gets one message for unknown, expired and reused links.
+        return _error(
+            status.HTTP_400_BAD_REQUEST,
+            _GENERIC_RESET_TOKEN_ERROR,
+            "reset_token_invalid",
+        )
+
+    return PasswordResetResponse()
+
+
 @router.post(
     "/login",
     response_model=LoginResult,
@@ -554,6 +642,19 @@ def mfa_verify(
 
     user = db.get(User, user_id)
     if user is None or not user.mfa_enabled or user.mfa_exempt:
+        return _unauthorized(
+            "That sign-in attempt has expired or is invalid. Sign in again.",
+            "mfa_challenge_invalid",
+        )
+
+    # A challenge token issued before a password reset must not finish a sign-in: the
+    # reset is meant to end every session that existed beforehand.
+    if token_invalidated_by_password_change(claims, user):
+        logger.info(
+            "auth: mfa challenge rejected after password change user_id=%s ip=%s",
+            user.id,
+            ip,
+        )
         return _unauthorized(
             "That sign-in attempt has expired or is invalid. Sign in again.",
             "mfa_challenge_invalid",

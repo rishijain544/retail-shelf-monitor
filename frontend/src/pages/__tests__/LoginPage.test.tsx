@@ -14,9 +14,9 @@ vi.mock('../../api/client', async (importOriginal) => {
 
 const AUTH_KEY = 'sm:auth:state';
 
-function renderLogin() {
+function renderLogin(entry: string | { pathname: string; state?: unknown } = '/login') {
   return render(
-    <MemoryRouter initialEntries={['/login']}>
+    <MemoryRouter initialEntries={[entry]}>
       <Routes>
         <Route path="/login" element={<LoginPage />} />
         {/* Stand-in for the authenticated shell, to prove the redirect happens. */}
@@ -42,6 +42,24 @@ describe('LoginPage demo access', () => {
 
     expect(screen.getByText(DEMO_EMAIL)).toBeInTheDocument();
     expect(screen.getByText(DEMO_PASSWORD)).toBeInTheDocument();
+  });
+
+  it('links to the forgot-password page from the password field', () => {
+    renderLogin();
+
+    expect(screen.getByRole('link', { name: /forgot password/i })).toHaveAttribute(
+      'href',
+      '/forgot-password',
+    );
+  });
+
+  it('shows the one-time post-reset notice and says two-factor still applies', () => {
+    // Router state written by /reset-password, which never issues a session itself.
+    renderLogin({ pathname: '/login', state: { notice: 'Password updated. Please log in.' } });
+
+    const notice = screen.getByRole('status');
+    expect(notice).toHaveTextContent('Password updated. Please log in.');
+    expect(notice).toHaveTextContent(/authenticator code/i);
   });
 
   it('signs in with one click, filling the form and storing the session', async () => {

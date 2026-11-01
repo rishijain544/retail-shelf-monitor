@@ -129,4 +129,6 @@ def test_lifespan_migrates_a_fresh_database_outside_production(sqlite_url, monke
 
 def test_head_revision_points_at_the_latest_migration():
     """Guard against a broken chain: an empty head means nothing would be applied."""
-    assert schema.head_revision() == "c9f4a2d6e8b1"
+    # Update this when a revision is added: it is what catches a chain whose newest
+    # revision has no child and was never wired in as the head.
+    assert schema.head_revision() == "f1a4c7d9b2e6"

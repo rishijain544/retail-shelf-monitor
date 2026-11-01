@@ -265,6 +265,18 @@ run (missing weights, no DB, no network), say so explicitly rather than implying
 - Signup must not return a token. An account is a login only once `email_verified` is true.
 - **No endpoint may disable MFA** or set `mfa_exempt`. Those two invariants are what make
   the second factor meaningful; `scripts/reset_mfa.py` is the operator escape hatch.
+- **A password reset issues no session and does not weaken MFA.** `POST
+  /auth/reset-password` returns a status only (no access/challenge/setup token), clears
+  the failed-login lockout but leaves `mfa_enabled`, `mfa_locked_until` and the recovery
+  codes alone, and sets `email_verified=true`. Signing in afterwards is a new login.
+- Reset tokens (`app/services/password_reset.py`) are stored as SHA-256 digests only, are
+  single-use, and a new request invalidates every earlier unused one. Never log or return
+  them — the `DEV_LOG_VERIFICATION_CODES` path is the sole exception, and only when no
+  email transport is configured. `mfa_exempt` accounts and `.test` addresses never get one.
+- `users.password_changed_at` is written truncated to whole seconds and compared against
+  each JWT's `iat` in `auth_deps.token_invalidated_by_password_change`, so every token
+  purpose is revoked by a reset. Reset links are built from `FRONTEND_BASE_URL`, never
+  from the request.
 - One-time codes are never logged or returned twice: signup codes are keyed
   `HMAC-SHA256` digests compared with `hmac.compare_digest`, TOTP secrets are Fernet
   ciphertext, recovery codes are bcrypt digests shown once at creation.

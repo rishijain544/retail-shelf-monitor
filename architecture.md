@@ -155,13 +155,20 @@ Static uploads are mounted **outside** the API prefix: `app.mount("/uploads", �
   token**: the new account is `email_verified = false` until the mailed code is confirmed
   by `POST /auth/verify-email`.
 - Passwords: bcrypt via passlib; input truncated to 72 bytes consistently on hash and
-  verify.
+  verify. Request bodies never reach that truncation: `PasswordStr` (`schemas/auth.py`)
+  rejects passwords over 72 UTF-8 bytes with a `422` naming the byte count, so a
+  40-character, 120-byte password cannot be accepted and silently weakened.
 - Tokens: HS256 JWT carrying `sub` (user id string) and a `purpose` claim.
   `purpose="access"` expires after `ACCESS_TOKEN_EXPIRE_MINUTES` (default 24 h);
   `mfa_challenge` lives 5 minutes and `mfa_setup` 15. `SECRET_KEY` is required in
   production/staging; in development an ephemeral random key is generated (tokens die on
   restart, with a warning). A token with no `purpose` — anything issued before purposes
   existed — is treated as invalid everywhere.
+- Every token carries `iat`. A token without a usable `iat` is rejected, and any token
+  older than the account's `users.password_changed_at` is rejected too (access and both
+  intermediate purposes, in `auth_deps.token_invalidated_by_password_change`). A password
+  reset therefore signs the account out everywhere; `password_changed_at` is stored at
+  whole-second precision because `iat` is second-granular.
 - `get_current_user` accepts **only** `purpose="access"` and loads the `User` row,
   returning `401` with `WWW-Authenticate: Bearer` for every failure mode. The challenge and
   setup tokens have their own dependencies in the same module (`get_mfa_challenge_user`,
@@ -204,11 +211,28 @@ mfa/verify ────────► access token      (TOTP or recovery code,
 - Five wrong passwords lock sign-in, and five wrong second factors lock MFA, each for
   `LOCKOUT_MINUTES` (default 15). A locked account answers `429` with a `Retry-After`
   header and a machine-readable `code`.
-- **No endpoint disables MFA.** `scripts/reset_mfa.py <email>` is the operator recovery
-  path for a lost device and lost codes; there is no password-reset flow yet.
+- **No endpoint disables MFA**, and a password reset cannot weaken it: a reset issues no
+  session, leaves `mfa_enabled`, `mfa_locked_until` and the recovery codes untouched, and
+  clears only the failed-login lockout. Signing in afterwards still demands the second
+  factor. `scripts/reset_mfa.py <email>` remains the operator path for a lost device and
+  lost codes.
+- **Password reset** (`app/services/password_reset.py`): `POST /auth/forgot-password`
+  answers the same `202` body for every address and runs the lookup + send in a background
+  task, so response time is not an account oracle. The token is 256 bits of
+  `secrets.token_urlsafe(32)`, only its SHA-256 digest is stored, one row is valid at a
+  time, and links live `PASSWORD_RESET_TTL_MINUTES`. Requests are limited per account
+  (`PASSWORD_RESET_COOLDOWN_SECONDS`) and per IP (in-memory sliding window, so a
+  multi-worker deployment gets one budget per worker). The link is built from
+  `FRONTEND_BASE_URL` only — never from request headers. `mfa_exempt` accounts and `.test`
+  addresses never receive a token.
+- `POST /auth/reset-password` sets the new password with the same rule as signup, marks
+  the address verified, moves `password_changed_at` forward, invalidates the other unused
+  links, and returns a status only — never an access, challenge or setup token.
 - Mail goes through the same `email_service` transports as alerts
   (`send_verification_code`), and a delivery failure never fails the signup — the row is
   created and the user can request a new code.
+- Reset mail reuses those transports too (`send_password_reset`,
+  `send_password_changed_notice`), with every dynamic value HTML-escaped.
 
 Tenant boundary:
 
@@ -340,10 +364,12 @@ the setup screen.
 | `ALERT_EMAIL_TO`, `ALERT_EMAIL_ENABLED` | Recipient override / master switch |
 | `CORS_ORIGINS`, `CORS_ORIGIN_REGEX` | Browser origins allowed to call the API |
 | `SECRET_KEY`, `ACCESS_TOKEN_EXPIRE_MINUTES` | JWT signing and lifetime |
+| `FRONTEND_BASE_URL` | Public dashboard origin used to build emailed links (never taken from request headers) |
+| `PASSWORD_RESET_TTL_MINUTES`, `PASSWORD_RESET_COOLDOWN_SECONDS` | Reset-link lifetime (30) and per-account request cooldown (60 s) |
 | `MFA_ENCRYPTION_KEY` | Fernet key encrypting TOTP secrets; required in strict environments |
 | `MFA_ISSUER_NAME` | Label shown in the authenticator app (default `ShelfMonitor`) |
 | `VERIFICATION_CODE_TTL_MINUTES`, `MAX_CODE_ATTEMPTS`, `LOCKOUT_MINUTES` | Signup-code lifetime, wrong-guess limit (5), lockout length (15 min) |
-| `DEV_LOG_VERIFICATION_CODES` | Development only: print a signup code when **no** email transport is configured |
+| `DEV_LOG_VERIFICATION_CODES` | Development only: print a signup code *or* password-reset link when **no** email transport is configured |
 | `ENVIRONMENT` | `development` \| `production` \| `staging` (strict environments enforce `SECRET_KEY` and `MFA_ENCRYPTION_KEY`) |
 | `AUTO_MIGRATE` | Apply the migration chain at startup (default `true`; not gated on `ENVIRONMENT`) |
 | `SEED_DEMO_ACCOUNT` | Create the demo account advertised on the sign-in page when missing (default: on outside `production`/`staging`; `render.yaml` sets it explicitly) |
@@ -407,6 +433,8 @@ warning on each boot, so local development needs only one secret.
 | `/login/mfa-setup` | `MfaSetupPage` | Mandatory enrolment: install the app, scan the QR code (rendered in-browser with `qrcode.react` from the `otpauth://` URI) or copy the manual key, confirm a code, then save 10 recovery codes before Continue unlocks |
 | `/signup` | `SignupPage` | Store + owner form; `202` with no token, then redirects to `/verify-email` |
 | `/verify-email` | `VerifyEmailPage` | 6-digit code, resend with a 60 s countdown matching the server cooldown |
+| `/forgot-password` | `ForgotPasswordPage` | Public. Requests a reset link and shows one fixed sentence for every address, so it cannot be used to probe for accounts; resend with a 60 s countdown |
+| `/reset-password` | `ResetPasswordPage` | Public. Reads `?token=` once, strips it from the address bar with `history.replaceState`, sets the new password under the signup rule, then sends the visitor to `/login` with a one-time notice — a reset never creates a session |
 | `/security` | `Security` | Shows whether two-factor is on and regenerates recovery codes (password + current code) |
 | `/` | `Dashboard` | Upload capture, poll pipeline, list/filter reports, CSV export |
 | `/reports/:id` | `ShelfDetail` | Image, detections overlay, fill/urgency/summary/action, previous fill |
@@ -463,6 +491,13 @@ frontend (nginx serving the built SPA, published on :5173)
   `.venv`/`__pycache__`.
 - Frontend is a static nginx image; the container's `:80` is published as `:5173`.
 - `VITE_API_URL` is passed as a build arg, not a runtime env var.
+- The backend's `DATABASE_URL` is set in its `environment:` block, built from the same
+  `${POSTGRES_*}` values the `db` service consumes. This is deliberate: `./backend:/app`
+  bind-mounts `backend/.env` into the image and pydantic-settings reads that file, so a
+  developer's local `DATABASE_URL=sqlite:///…` would otherwise win. `environment` outranks
+  the dotenv file. `ENVIRONMENT=docker` (also set there) makes the app reject a SQLite
+  URL at startup instead of failing at the first query — see
+  `Settings._reject_sqlite_in_container`.
 - The backend healthcheck greps the JSON body for `"status": "healthy"` because
   `/health` always answers `200`.
 

@@ -1,10 +1,41 @@
-from typing import Optional
+from typing import Annotated, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
+
+from app.core.security import BCRYPT_MAX_BYTES
 
 # Deliberately permissive: a non-empty local part, an "@", and a dotted domain.
 # (EmailStr would need the extra `email-validator` dependency.)
 _EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+
+def _reject_passwords_bcrypt_would_truncate(value: str) -> str:
+    """Refuse a password whose UTF-8 form is longer than bcrypt reads.
+
+    ``Field(max_length=...)`` counts *characters*, but bcrypt stops at 72 **bytes**.
+    A 40-character password of 3-byte characters is 120 bytes: it would pass a
+    character check and then be silently hashed as its first 72 bytes, so two different
+    passwords could open the same account. Rejecting it here is both honest and safe;
+    without the check the only symptom is a weaker password than the user typed.
+    """
+    size = len(value.encode("utf-8"))
+    if size > BCRYPT_MAX_BYTES:
+        raise ValueError(
+            f"Password is too long: {size} bytes when UTF-8 encoded, but the limit is "
+            f"{BCRYPT_MAX_BYTES}. Accented letters, emoji and many non-Latin characters "
+            "count as several bytes each — use a shorter password."
+        )
+    return value
+
+
+# The one password rule. Signup and password reset both use this alias, so a reset can
+# never accept something signup would refuse (or the reverse). The character limit is
+# kept as well: no UTF-8 character is shorter than one byte, so it is implied by the
+# byte limit, but it documents the plain-ASCII expectation and bounds the error message.
+PasswordStr = Annotated[
+    str,
+    Field(min_length=8, max_length=BCRYPT_MAX_BYTES),
+    AfterValidator(_reject_passwords_bcrypt_would_truncate),
+]
 
 
 class _EmailNormalizingModel(BaseModel):
@@ -25,7 +56,27 @@ class SignupRequest(_EmailNormalizingModel):
     store_name: str = Field(min_length=1, max_length=255)
     store_location: Optional[str] = Field(default=None, max_length=255)
     email: str = Field(pattern=_EMAIL_PATTERN, max_length=320)
-    password: str = Field(min_length=8, max_length=72)
+    password: PasswordStr
+
+
+class ForgotPasswordRequest(_EmailNormalizingModel):
+    """Payload for POST /auth/forgot-password.
+
+    Normalised like signup/login so a mixed-case address finds the same account.
+    """
+
+    email: str = Field(min_length=3, max_length=320)
+
+
+class ResetPasswordRequest(BaseModel):
+    """Payload for POST /auth/reset-password.
+
+    ``token`` is the opaque value from the emailed link. It is intentionally not
+    normalised: the value is compared as sent.
+    """
+
+    token: str = Field(min_length=16, max_length=200)
+    new_password: PasswordStr
 
 
 class LoginRequest(_EmailNormalizingModel):
@@ -161,3 +212,14 @@ class StatusResponse(BaseModel):
 
     status: str
     message: Optional[str] = None
+
+
+class PasswordResetResponse(BaseModel):
+    """The result of applying a reset link — a status only, never a session.
+
+    Signing in again is a separate step (including MFA), so this response deliberately
+    carries no access, challenge or setup token of any kind.
+    """
+
+    status: str = "password_reset"
+    message: str = "Your password has been changed. Sign in with your new password."

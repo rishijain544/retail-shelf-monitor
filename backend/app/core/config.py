@@ -10,6 +10,11 @@ logger = logging.getLogger(__name__)
 # Environments where a missing or weak SECRET_KEY must abort startup.
 _STRICT_ENVIRONMENTS = {"production", "prod", "staging"}
 
+# Environments where a SQLite DATABASE_URL cannot possibly be right. "docker" is set
+# by docker-compose.yml for the backend service; production/staging always point at a
+# managed database. See _reject_sqlite_in_container for the failure this prevents.
+_SQLITE_FORBIDDEN_ENVIRONMENTS = _STRICT_ENVIRONMENTS | {"docker"}
+
 # Absolute path to the backend/ directory (config.py is at backend/app/core/config.py)
 _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -127,6 +132,16 @@ class Settings(BaseSettings):
     # How long an issued access token stays valid.
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 1 day
 
+    # Public origin of the dashboard, used only to build links inside emails (today the
+    # password-reset link). Never derived from the request: behind Render/Vercel the
+    # Host/X-Forwarded-* headers are proxy-controlled, and a reset link pointing at an
+    # attacker's host would hand them the token.
+    FRONTEND_BASE_URL: str = "http://localhost:5173"
+    # How long an emailed password-reset link stays valid, and the per-account cooldown
+    # between reset requests (a second request inside it is silently ignored).
+    PASSWORD_RESET_TTL_MINUTES: int = 30
+    PASSWORD_RESET_COOLDOWN_SECONDS: int = 60
+
     # Multi-factor authentication.
     #
     # MFA_ENCRYPTION_KEY is a Fernet key used to encrypt each account's TOTP secret
@@ -197,6 +212,33 @@ class Settings(BaseSettings):
         if self.SEED_DEMO_ACCOUNT is not None:
             return self.SEED_DEMO_ACCOUNT
         return not self.IS_STRICT_ENVIRONMENT
+
+    @model_validator(mode="after")
+    def _reject_sqlite_in_container(self) -> "Settings":
+        """Refuse a SQLite DATABASE_URL where no SQLite file can exist.
+
+        The backend service bind-mounts ./backend into the image, so backend/.env is
+        present at /app/.env and pydantic-settings loads it inside the container too. A
+        local `DATABASE_URL=sqlite:///d:/.../shelf_monitoring.db` therefore overrode the
+        Postgres service and the container crash-looped with
+        `sqlite3.OperationalError: unable to open database file` — a host path that does
+        not exist in the image, reported by alembic or the engine without naming the
+        variable at fault. Failing here names the culprit and the fix instead.
+        """
+        url = (self.DATABASE_URL or "").strip()
+        if not url.lower().startswith("sqlite"):
+            return self
+        if self.ENVIRONMENT.strip().lower() not in _SQLITE_FORBIDDEN_ENVIRONMENTS:
+            return self
+        raise RuntimeError(
+            f"DATABASE_URL is SQLite ('{url.split('?')[0]}') but ENVIRONMENT="
+            f"'{self.ENVIRONMENT}' cannot use a SQLite file. Inside the container this "
+            "value comes from backend/.env, which is bind-mounted into the image and "
+            "holds a host path. docker-compose.yml pins DATABASE_URL to the db service; "
+            "if you run the image outside compose, unset DATABASE_URL (or point it at "
+            "postgresql://<user>:<password>@<host>:<port>/<dbname>) so the POSTGRES_* "
+            "values build the connection instead."
+        )
 
     @model_validator(mode="after")
     def _check_auth_secrets(self) -> "Settings":

@@ -115,6 +115,7 @@ outside the ORM.
 | `login_locked_until` | DateTime(tz) | yes | `NULL` | Password lockout expiry |
 | `failed_mfa_attempts` | Integer | no | `0` | Consecutive wrong second factors |
 | `mfa_locked_until` | DateTime(tz) | yes | `NULL` | MFA lockout expiry |
+| `password_changed_at` | DateTime(tz) | yes | `NULL` | Last password reset; tokens with an older `iat` are refused |
 
 - One row per dashboard login. Signup creates a new store per account, so the normal
   flow is one account per store; the schema does not forbid several, and alert delivery
@@ -136,6 +137,11 @@ outside the ORM.
   for `DateTime(timezone=True)`, and comparing one to an aware `now` raises `TypeError`.
 - The migration grandfathered existing rows with `email_verified = true` and left
   `mfa_enabled = false`, so an upgrade never locks out a live deployment.
+- **`password_changed_at` is truncated to whole seconds when written**, because JWT `iat`
+  claims are second-granular: a finer value would reject the first session created right
+  after a successful reset. It is `NULL` for accounts that never reset, and `NULL` means
+  "no token is stale by this rule". A reset does **not** touch MFA state,
+  `mfa_locked_until` or `mfa_recovery_codes`.
 
 ### 3.3 `cameras`
 
@@ -305,6 +311,27 @@ SKU-level inventory.
   without adding real protection. What protects these codes is 32 bits of entropy plus the
   5-attempt lockout.
 
+### 3.12 `password_reset_tokens`
+
+| Column | Type | Null | Default | Notes |
+|--------|------|------|---------|-------|
+| `id` | Integer | no | autoincrement | PK, indexed |
+| `user_id` | Integer | no | — | FK → `users.id`, `ON DELETE CASCADE`, indexed |
+| `token_hash` | String(64) | no | — | **Unique index**; SHA-256 hex of the emailed token |
+| `expires_at` | DateTime(tz) | no | — | `PASSWORD_RESET_TTL_MINUTES` after creation |
+| `used_at` | DateTime(tz) | yes | `NULL` | Set on use *and* when a newer request supersedes it |
+| `created_at` | DateTime(tz) | no | `now()` | Server default; drives the per-account cooldown |
+| `requested_ip` | String(64) | yes | `NULL` | Requester address for support/abuse triage |
+
+- **The token itself is never stored.** What is stored is `sha256(token)`, where the token
+  is 256 bits of `secrets.token_urlsafe(32)` — a dump yields no working link. Lookups
+  compare with `hmac.compare_digest`.
+- One valid row per account: creating a token marks every earlier unused row `used_at`, and
+  a reset marks all remaining rows used. Rows are kept rather than deleted so the cooldown
+  and the audit trail survive.
+- The shared demo account (`mfa_exempt`) and every `.test` address never get a row, so
+  neither can be reset.
+
 ---
 
 ## 4. Migration chain
@@ -322,6 +349,7 @@ Alembic config: `backend/alembic.ini` (`script_location = migrations`). Run from
 | 6 | `b8f1c4d7e2a6` | `d5e8b3f1c7a4` | Add `alerts.sent_to_email`, `alerts.email_recipients` |
 | 7 | `a7c1e9f4d2b8` | `b8f1c4d7e2a6` | Add `email_settings` (verified transport survives redeploys) |
 | 8 | `c9f4a2d6e8b1` | `a7c1e9f4d2b8` | Add MFA + verification columns to `users`; add `email_verification_codes`, `mfa_recovery_codes`; grandfather existing users as verified |
+| 9 | `f1a4c7d9b2e6` | `c9f4a2d6e8b1` | Add `users.password_changed_at`; add `password_reset_tokens` |
 
 Notes:
 
@@ -330,6 +358,10 @@ Notes:
   stay valid.
 - The `low_confidence` migration also recomputes `urgency` for legacy `unknown` rows from
   the fill thresholds (`≥0.6` low, `≥0.3` medium, else high).
+- Revision 9 uses `op.batch_alter_table`, `sa.func.now()` and no raw PostgreSQL-only SQL,
+  so it applies unchanged to SQLite and PostgreSQL. Check both: the SQLite chain in the
+  suite, and `python scripts/check_migrations_postgres.py` against a fresh PostgreSQL
+  database.
 
 Commands (from `backend/`):
 
@@ -372,6 +404,8 @@ does not retry (and log a failure) on every restart.
 | all tables | `ix_<table>_id` on `id` | no |
 | `users` | `ix_users_email` | **yes** |
 | `users` | `ix_users_store_id` | no |
+| `password_reset_tokens` | `ix_password_reset_tokens_token_hash` | **yes** |
+| `password_reset_tokens` | `ix_password_reset_tokens_user_id` | no |
 | `products` | `ix_products_upc` | **yes** |
 
 Foreign keys other than `users.store_id` are not explicitly indexed. Read paths join

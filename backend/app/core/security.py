@@ -53,7 +53,11 @@ MFA_SETUP_EXPIRE_MINUTES = 15
 # bcrypt only considers the first 72 bytes of a password. Older bcrypt builds
 # truncated silently, newer ones raise, so we truncate consistently on both the
 # hash and the verify side to keep behaviour stable across upgrades.
-_BCRYPT_MAX_BYTES = 72
+#
+# Request bodies are rejected above this limit by `schemas.auth.PasswordStr`, so
+# truncation here only ever applies to values that bypass the API (seed/reset scripts)
+# or to a login attempt with an over-long password.
+BCRYPT_MAX_BYTES = 72
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -81,9 +85,9 @@ def _signing_key() -> str:
 def _prepare(password: str) -> str:
     """Trim `password` to bcrypt's 72-byte input limit without splitting a char."""
     encoded = password.encode("utf-8")
-    if len(encoded) <= _BCRYPT_MAX_BYTES:
+    if len(encoded) <= BCRYPT_MAX_BYTES:
         return password
-    return encoded[:_BCRYPT_MAX_BYTES].decode("utf-8", errors="ignore")
+    return encoded[:BCRYPT_MAX_BYTES].decode("utf-8", errors="ignore")
 
 
 def hash_password(password: str) -> str:
